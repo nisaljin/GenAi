@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +40,10 @@ DEFAULT_VERIFIER = "laion/clap-htsat-fused"
 
 WAV_SAMPLE_RATE = 16000
 CLAP_SAMPLE_RATE = 48000
+
+
+def _log(message: str) -> None:
+    print(message, flush=True)
 
 
 class PerceptionRequest(BaseModel):
@@ -94,8 +99,11 @@ class ModelRegistry:
 
     def load_perception(self) -> Any:
         if self._perception_pipe is not None:
+            _log("[load][perception] using cached pipeline")
             return self._perception_pipe
 
+        _log(f"[load][perception] start model={self.config.perception_model}")
+        t0 = time.time()
         self._perception_pipe = pipeline(
             task="image-text-to-text",
             model=self.config.perception_model,
@@ -106,12 +114,16 @@ class ModelRegistry:
                 "token": self.config.hf_token,
             },
         )
+        _log(f"[load][perception] done elapsed_sec={time.time() - t0:.2f}")
         return self._perception_pipe
 
     def load_planner(self) -> tuple[AutoTokenizer, AutoModelForCausalLM]:
         if self._planner_tokenizer is not None and self._planner_model is not None:
+            _log("[load][planner] using cached tokenizer+model")
             return self._planner_tokenizer, self._planner_model
 
+        _log(f"[load][planner] start model={self.config.planner_model}")
+        t0 = time.time()
         tokenizer = AutoTokenizer.from_pretrained(
             self.config.planner_model,
             cache_dir=self.config.cache_dir,
@@ -127,6 +139,7 @@ class ModelRegistry:
 
         self._planner_tokenizer = tokenizer
         self._planner_model = model
+        _log(f"[load][planner] done elapsed_sec={time.time() - t0:.2f}")
         return tokenizer, model
 
     def load_execution(self):
@@ -136,20 +149,27 @@ class ModelRegistry:
             )
 
         if self._execution_model is not None:
+            _log("[load][execution] using cached model")
             return self._execution_model
 
+        _log(f"[load][execution] start model={self.config.execution_model}")
+        t0 = time.time()
         model = AudioGen.get_pretrained(
             self.config.execution_model,
             device=self.config.device,
             cache_dir=self.config.cache_dir,
         )
         self._execution_model = model
+        _log(f"[load][execution] done elapsed_sec={time.time() - t0:.2f}")
         return model
 
     def load_verification(self) -> tuple[ClapProcessor, ClapModel]:
         if self._verification_processor is not None and self._verification_model is not None:
+            _log("[load][verification] using cached processor+model")
             return self._verification_processor, self._verification_model
 
+        _log(f"[load][verification] start model={self.config.verification_model}")
+        t0 = time.time()
         processor = ClapProcessor.from_pretrained(
             self.config.verification_model,
             cache_dir=self.config.cache_dir,
@@ -163,6 +183,7 @@ class ModelRegistry:
 
         self._verification_processor = processor
         self._verification_model = model
+        _log(f"[load][verification] done elapsed_sec={time.time() - t0:.2f}")
         return processor, model
 
     def warmup_all(self) -> dict[str, str]:
@@ -173,11 +194,15 @@ class ModelRegistry:
             ("execution", self.load_execution),
             ("verification", self.load_verification),
         ):
+            _log(f"[warmup][{name}] start")
+            t0 = time.time()
             try:
                 loader()
                 status[name] = "ok"
+                _log(f"[warmup][{name}] ok elapsed_sec={time.time() - t0:.2f}")
             except Exception as exc:  # pragma: no cover
                 status[name] = f"error: {exc}"
+                _log(f"[warmup][{name}] error elapsed_sec={time.time() - t0:.2f} detail={exc}")
         return status
 
 
@@ -387,12 +412,21 @@ def main() -> None:
         dtype=dtype,
     )
 
+    _log("[startup] Multi-model Foley API configuration")
+    _log(f"[startup] device={config.device} dtype={config.dtype}")
+    _log(f"[startup] cache_dir={config.cache_dir}")
+    _log(f"[startup] perception_model={config.perception_model}")
+    _log(f"[startup] planner_model={config.planner_model}")
+    _log(f"[startup] execution_model={config.execution_model}")
+    _log(f"[startup] verification_model={config.verification_model}")
+
     registry = ModelRegistry(config)
     app = build_app(registry)
 
     if args.warmup:
+        _log("[startup] warmup requested")
         status = registry.warmup_all()
-        print("[warmup]", status)
+        _log(f"[warmup] {status}")
 
     uvicorn.run(app, host=args.host, port=args.port)
 
