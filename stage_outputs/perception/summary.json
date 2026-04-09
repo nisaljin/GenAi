@@ -1,0 +1,8 @@
+{
+  "video_path": "/Users/nisaljinadasa/Documents/Coding/GenAI---Music-in-video/input_video.mp4",
+  "device": "mps",
+  "model": "Salesforce/blip2-opt-2.7b",
+  "num_keyframes": 7,
+  "num_lines": 7,
+  "vlm_log_path": "/Users/nisaljinadasa/Documents/Coding/GenAI---Music-in-video/stage_outputs/perception/vlm_log.txt"
+}

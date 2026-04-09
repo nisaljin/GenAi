@@ -73,7 +73,22 @@ def evaluate_audio(req: EvalRequest):
         audio_array, sr = librosa.load(io.BytesIO(audio_bytes), sr=48000)
 
         # Process through CLAP
-        inputs = clap_processor(text=[req.prompt], audios=audio_array, return_tensors="pt", padding=True, sampling_rate=48000)
+        try:
+            inputs = clap_processor(
+                text=[req.prompt],
+                audio=audio_array,
+                return_tensors="pt",
+                padding=True,
+                sampling_rate=48000,
+            )
+        except (TypeError, ValueError):
+            inputs = clap_processor(
+                text=[req.prompt],
+                audios=audio_array,
+                return_tensors="pt",
+                padding=True,
+                sampling_rate=48000,
+            )
         inputs = {k: v.to("cuda") for k, v in inputs.items()}
         
         with torch.no_grad():
