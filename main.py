@@ -2,6 +2,8 @@ import cv2
 import os
 import json
 import base64
+import shutil
+import subprocess
 import numpy as np
 import requests
 from pydub import AudioSegment
@@ -179,11 +181,15 @@ class PlannerNode:
         # Groq will automatically pick up GROQ_API_KEY from the environment
         self.client = Groq() 
 
-    def create_audio_plan(self, vlm_log: str) -> List[AudioEvent]:
+    def create_audio_plan(self, vlm_log: str, video_duration_sec: float) -> List[AudioEvent]:
+        duration = max(float(video_duration_sec), 0.5)
         prompt = (
             "You are a Foley Audio Director. Read this video log and output a JSON object containing a 'data' array of acoustic events. "
-            "Strictly use this format: {\"data\": [{\"timestamp_sec\": 0.0, \"duration_sec\": 13.0, \"original_prompt\": \"Continuous ambient sound of...\"}]}. "
-            "CRITICAL: If the scene has a continuous atmosphere (like a room or nature), create ONE long event that spans the whole duration. "
+            "Strictly use this format: {\"data\": [{\"timestamp_sec\": 0.0, \"duration_sec\": 2.0, \"original_prompt\": \"...\"}]}. "
+            f"The video duration is {duration:.2f} seconds. "
+            "CRITICAL: All events MUST fit inside [0, video_duration]. "
+            "For every event: timestamp_sec >= 0, duration_sec > 0, and timestamp_sec + duration_sec <= video_duration. "
+            "CRITICAL: If the scene has a continuous atmosphere (like a room or nature), create ONE long event that spans nearly the whole duration. "
             "The 'original_prompt' MUST describe the AUDIO, not the visual. Use acoustic keywords (e.g., 'Resonant, wet splash, ambient wind'). "
             "Do not output markdown, only raw JSON."
             f"\n\nVideo Log:\n{vlm_log}"
@@ -200,13 +206,31 @@ class PlannerNode:
             raw_json = chat_completion.choices[0].message.content
             events_data = json.loads(raw_json).get("data", [])
             
-            # Map the new duration variable
-            events = [AudioEvent(
-                timestamp_sec=e["timestamp_sec"], 
-                duration_sec=max(float(e.get("duration_sec", 2.0)), 0.5),
-                original_prompt=e["original_prompt"], 
-                refined_prompt=""
-            ) for e in events_data]
+            events: List[AudioEvent] = []
+            for e in events_data:
+                ts = max(float(e.get("timestamp_sec", 0.0)), 0.0)
+                dur = max(float(e.get("duration_sec", 2.0)), 0.5)
+                if ts >= duration:
+                    continue
+                dur = min(dur, duration - ts)
+                if dur <= 0:
+                    continue
+
+                events.append(AudioEvent(
+                    timestamp_sec=ts,
+                    duration_sec=dur,
+                    original_prompt=str(e.get("original_prompt", "")).strip(),
+                    refined_prompt=""
+                ))
+
+            if not events:
+                # Conservative fallback: one ambient event across full clip.
+                events = [AudioEvent(
+                    timestamp_sec=0.0,
+                    duration_sec=duration,
+                    original_prompt="continuous ambient room tone matching visible scene",
+                    refined_prompt=""
+                )]
             
             print(f"[Planner Node] Generated {len(events)} prompts.")
             return events
@@ -238,7 +262,7 @@ class ExecutionNode:
     def __init__(self):
         base_url = os.getenv("AUDIO_API_URL").rstrip('/')
         self.api_url, self.api_url_fallback = build_endpoint(base_url, "/execution", "/generate")
-        self.output_dir = "./generated_audio"
+        self.output_dir = os.getenv("GENERATED_AUDIO_DIR", "./generated_outputs/audio")
         os.makedirs(self.output_dir, exist_ok=True)
 
     def generate_audio(self, prompt: str, timestamp: float, duration: float, attempt: int) -> str:
@@ -295,6 +319,29 @@ class FoleyOrchestrator:
         self.execution = ExecutionNode()
         self.verification = VerificationNode(threshold=0.50)
         self.max_retries = 3
+        self.max_video_seconds = float(os.getenv("MAX_VIDEO_SECONDS", "15"))
+        self.video_output_dir = os.getenv("GENERATED_VIDEO_DIR", "./generated_outputs/video")
+        self.temp_output_dir = os.getenv("GENERATED_TEMP_DIR", "./generated_outputs/tmp")
+        os.makedirs(self.video_output_dir, exist_ok=True)
+        os.makedirs(self.temp_output_dir, exist_ok=True)
+
+    def prepare_video(self, video_path: str) -> tuple[str, float, bool]:
+        clip = VideoFileClip(video_path)
+        duration = float(clip.duration)
+        if duration <= self.max_video_seconds:
+            clip.close()
+            return video_path, duration, False
+
+        trimmed_path = os.path.join(self.temp_output_dir, "trimmed_input.mp4")
+        print(
+            f"[Orchestrator] Trimming input video from {duration:.2f}s to "
+            f"{self.max_video_seconds:.2f}s."
+        )
+        trimmed = clip.subclipped(0, self.max_video_seconds)
+        trimmed.write_videofile(trimmed_path, codec="libx264", audio_codec="aac")
+        trimmed.close()
+        clip.close()
+        return trimmed_path, self.max_video_seconds, True
 
     def stitch_audio_to_video(self, video_path: str, events: List[AudioEvent], output_path: str):
         print("[Stitcher] Assembling final video...")
@@ -308,54 +355,91 @@ class FoleyOrchestrator:
                 insert_position_ms = int(event.timestamp_sec * 1000)
                 base_audio = base_audio.overlay(foley_clip, position=insert_position_ms)
 
-        temp_audio_path = "./temp_mixed_audio.wav"
+        temp_audio_path = os.path.join(self.temp_output_dir, "mixed_audio.wav")
         base_audio.export(temp_audio_path, format="wav")
+        video_clip.close()
 
-        final_audio_clip = AudioFileClip(temp_audio_path)
-        final_video = video_clip.with_audio(final_audio_clip)
-        final_video.write_videofile(output_path, codec="libx264", audio_codec="aac")
+        # ffmpeg muxing is more robust than moviepy audio attachment across codec/container variations.
+        if shutil.which("ffmpeg"):
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-i",
+                temp_audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-shortest",
+                output_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg mux failed: {result.stderr.strip()}")
+        else:
+            # Fallback path for environments without ffmpeg binary available.
+            vclip = VideoFileClip(video_path)
+            aclip = AudioFileClip(temp_audio_path)
+            final_video = vclip.with_audio(aclip)
+            final_video.write_videofile(output_path, codec="libx264", audio_codec="aac")
+            final_video.close()
+            aclip.close()
+            vclip.close()
         
         os.remove(temp_audio_path)
         print(f"[Stitcher] Success! Final video saved to {output_path}")
 
     def run_pipeline(self, video_path: str, output_path: str):
         print(f"--- Starting Autonomous Foley Generation for {video_path} ---")
-        
-        vlm_log = self.perception.analyze_video(video_path)
-        if vlm_log.startswith("Error:"):
-            raise RuntimeError(f"Perception failed: {vlm_log}")
-        audio_plan = self.planner.create_audio_plan(vlm_log)
-        
-        final_events = []
-        for event in audio_plan:
-            current_prompt = event.original_prompt
-            success = False
-            
-            for attempt in range(1, self.max_retries + 1):
-                print(f"  -> Processing event at {event.timestamp_sec}s (Attempt {attempt}/{self.max_retries})")
-                
-                audio_path = self.execution.generate_audio(current_prompt, event.timestamp_sec, event.duration_sec, attempt)
-                score = self.verification.evaluate(current_prompt, audio_path)
-                
-                if score >= self.verification.threshold:
-                    print("  -> [Critique Passed] Semantic match achieved.")
+        if not os.path.isabs(output_path) and os.path.dirname(output_path) == "":
+            output_path = os.path.join(self.video_output_dir, output_path)
+        prepared_video_path, prepared_duration, is_temp = self.prepare_video(video_path)
+        print(f"[Orchestrator] Using timeline duration: {prepared_duration:.2f}s")
+        try:
+            vlm_log = self.perception.analyze_video(prepared_video_path)
+            if vlm_log.startswith("Error:"):
+                raise RuntimeError(f"Perception failed: {vlm_log}")
+            audio_plan = self.planner.create_audio_plan(vlm_log, prepared_duration)
+
+            final_events = []
+            for event in audio_plan:
+                current_prompt = event.original_prompt
+                success = False
+
+                for attempt in range(1, self.max_retries + 1):
+                    print(f"  -> Processing event at {event.timestamp_sec}s (Attempt {attempt}/{self.max_retries})")
+
+                    audio_path = self.execution.generate_audio(current_prompt, event.timestamp_sec, event.duration_sec, attempt)
+                    score = self.verification.evaluate(current_prompt, audio_path)
+
+                    if score >= self.verification.threshold:
+                        print("  -> [Critique Passed] Semantic match achieved.")
+                        event.audio_file_path = audio_path
+                        event.similarity_score = score
+                        event.refined_prompt = current_prompt
+                        success = True
+                        break
+                    else:
+                        print("  -> [Critique Failed] Semantic mismatch. Retrying...")
+                        current_prompt = self.planner.refine_prompt(current_prompt, score)
+
+                if not success:
+                    print(f"  -> [Warning] Event at {event.timestamp_sec}s failed to reach threshold after {self.max_retries} attempts. Using best effort.")
                     event.audio_file_path = audio_path
-                    event.similarity_score = score
-                    event.refined_prompt = current_prompt
-                    success = True
-                    break
-                else:
-                    print("  -> [Critique Failed] Semantic mismatch. Retrying...")
-                    current_prompt = self.planner.refine_prompt(current_prompt, score)
-            
-            if not success:
-                print(f"  -> [Warning] Event at {event.timestamp_sec}s failed to reach threshold after {self.max_retries} attempts. Using best effort.")
-                event.audio_file_path = audio_path 
-                
-            final_events.append(event)
-            print("-" * 40)
-            
-        self.stitch_audio_to_video(video_path, final_events, output_path)
+
+                final_events.append(event)
+                print("-" * 40)
+
+            self.stitch_audio_to_video(prepared_video_path, final_events, output_path)
+        finally:
+            if is_temp and os.path.exists(prepared_video_path):
+                os.remove(prepared_video_path)
 
 # ==========================================
 # Execution Entry Point
