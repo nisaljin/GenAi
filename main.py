@@ -4,11 +4,12 @@ import json
 import base64
 import shutil
 import subprocess
+import traceback
 import numpy as np
 import requests
 from pydub import AudioSegment
 from moviepy import VideoFileClip, AudioFileClip
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Callable, Optional
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from groq import Groq
@@ -41,6 +42,33 @@ class AudioEvent:
     refined_prompt: str
     audio_file_path: str = None
     similarity_score: float = 0.0
+    agent_trace: List[Dict[str, Any]] = None
+
+
+@dataclass
+class AttemptRecord:
+    attempt: int
+    prompt: str
+    score: float
+    audio_file_path: str
+
+
+@dataclass
+class EventAgentState:
+    timestamp_sec: float
+    duration_sec: float
+    best_score: float = -1.0
+    best_audio_file_path: str = ""
+    best_prompt: str = ""
+    attempts: List[AttemptRecord] = None
+    reasoning_trace: List[Dict[str, Any]] = None
+    accepted: bool = False
+
+    def __post_init__(self):
+        if self.attempts is None:
+            self.attempts = []
+        if self.reasoning_trace is None:
+            self.reasoning_trace = []
 
 # ==========================================
 # Node 1: Perception (Vision)
@@ -254,6 +282,96 @@ class PlannerNode:
             print(f"[Planner Node] Error refining: {e}")
             return failed_prompt + ", highly detailed, distinct sound"
 
+    def decide_iteration(
+        self,
+        event: AudioEvent,
+        current_prompt: str,
+        score: float,
+        threshold: float,
+        attempt: int,
+        max_retries: int,
+        state: EventAgentState,
+    ) -> Dict[str, Any]:
+        attempts_summary = [
+            {
+                "attempt": a.attempt,
+                "prompt": a.prompt,
+                "score": round(a.score, 4),
+            }
+            for a in state.attempts
+        ]
+        payload = {
+            "event": {
+                "timestamp_sec": round(event.timestamp_sec, 3),
+                "duration_sec": round(event.duration_sec, 3),
+                "original_prompt": event.original_prompt,
+            },
+            "current_prompt": current_prompt,
+            "score": round(score, 4),
+            "threshold": threshold,
+            "attempt": attempt,
+            "max_retries": max_retries,
+            "best_score_so_far": round(state.best_score, 4),
+            "best_prompt_so_far": state.best_prompt,
+            "attempts_so_far": attempts_summary,
+        }
+        controller_prompt = (
+            "You are an agent controller for iterative Foley generation. "
+            "Choose one action based on current CLAP score and history. "
+            "Allowed actions: ACCEPT, RETRY_REWRITE, RETRY_BEST, STOP_BEST. "
+            "Return ONLY JSON with keys: action, reasoning, confidence, next_prompt. "
+            "Rules: "
+            "1) If score >= threshold, prefer ACCEPT. "
+            "2) If final attempt and score < threshold, use STOP_BEST. "
+            "3) For RETRY_REWRITE, provide an improved next_prompt. "
+            "4) For RETRY_BEST, next_prompt should be best_prompt_so_far if available. "
+            "5) confidence in [0,1]."
+            f"\n\nState:\n{json.dumps(payload)}"
+        )
+        try:
+            chat_completion = self.client.chat.completions.create(
+                messages=[{"role": "user", "content": controller_prompt}],
+                model=self.model_name,
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            raw = chat_completion.choices[0].message.content
+            decision = json.loads(raw)
+            action = str(decision.get("action", "")).strip().upper()
+            if action not in {"ACCEPT", "RETRY_REWRITE", "RETRY_BEST", "STOP_BEST"}:
+                action = "RETRY_REWRITE"
+
+            reasoning = str(decision.get("reasoning", "")).strip()
+            next_prompt = str(decision.get("next_prompt", "")).strip()
+            confidence = float(decision.get("confidence", 0.5))
+            confidence = min(max(confidence, 0.0), 1.0)
+
+            return {
+                "action": action,
+                "reasoning": reasoning or "No reasoning provided by controller.",
+                "confidence": confidence,
+                "next_prompt": next_prompt,
+                "source": "groq",
+            }
+        except Exception as e:
+            print(f"[Planner Node] Controller decision error: {e}")
+            if score >= threshold:
+                action = "ACCEPT"
+            elif attempt >= max_retries:
+                action = "STOP_BEST"
+            elif state.best_prompt and len(state.attempts) >= 2 and state.attempts[-1].score < state.attempts[-2].score:
+                action = "RETRY_BEST"
+            else:
+                action = "RETRY_REWRITE"
+
+            return {
+                "action": action,
+                "reasoning": "Heuristic fallback controller decision.",
+                "confidence": 0.4,
+                "next_prompt": "",
+                "source": "heuristic",
+            }
+
 # ==========================================
 # Node 3: Execution (Synthesis)
 # ==========================================
@@ -313,7 +431,7 @@ class VerificationNode:
 # ==========================================
 
 class FoleyOrchestrator:
-    def __init__(self):
+    def __init__(self, event_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.perception = PerceptionNode()
         self.planner = PlannerNode()
         self.execution = ExecutionNode()
@@ -322,8 +440,184 @@ class FoleyOrchestrator:
         self.max_video_seconds = float(os.getenv("MAX_VIDEO_SECONDS", "15"))
         self.video_output_dir = os.getenv("GENERATED_VIDEO_DIR", "./generated_outputs/video")
         self.temp_output_dir = os.getenv("GENERATED_TEMP_DIR", "./generated_outputs/tmp")
+        self.agent_log_dir = os.getenv("AGENT_LOG_DIR", "./generated_outputs/agent_logs")
+        self.event_callback = event_callback
         os.makedirs(self.video_output_dir, exist_ok=True)
         os.makedirs(self.temp_output_dir, exist_ok=True)
+        os.makedirs(self.agent_log_dir, exist_ok=True)
+
+    def emit_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        if not self.event_callback:
+            return
+        try:
+            self.event_callback({"type": event_type, "payload": payload})
+        except Exception as e:
+            print(f"[Orchestrator] Event callback error: {e}")
+
+    def run_event_agent(self, event: AudioEvent) -> AudioEvent:
+        state = EventAgentState(timestamp_sec=event.timestamp_sec, duration_sec=event.duration_sec)
+        current_prompt = event.original_prompt
+
+        for attempt in range(1, self.max_retries + 1):
+            self.emit_event("attempt_started", {
+                "timestamp_sec": event.timestamp_sec,
+                "duration_sec": event.duration_sec,
+                "attempt": attempt,
+                "max_retries": self.max_retries,
+                "prompt": current_prompt,
+            })
+            print(
+                f"  -> [Agent] Event {event.timestamp_sec:.2f}s | "
+                f"attempt={attempt}/{self.max_retries}"
+            )
+
+            audio_path = self.execution.generate_audio(
+                current_prompt,
+                event.timestamp_sec,
+                event.duration_sec,
+                attempt,
+            )
+            score = self.verification.evaluate(current_prompt, audio_path)
+            self.emit_event("clap_scored", {
+                "timestamp_sec": event.timestamp_sec,
+                "attempt": attempt,
+                "prompt": current_prompt,
+                "score": round(score, 4),
+                "audio_file_path": audio_path,
+                "threshold": self.verification.threshold,
+            })
+
+            state.attempts.append(AttemptRecord(
+                attempt=attempt,
+                prompt=current_prompt,
+                score=score,
+                audio_file_path=audio_path,
+            ))
+
+            if score > state.best_score:
+                state.best_score = score
+                state.best_audio_file_path = audio_path
+                state.best_prompt = current_prompt
+
+            decision = self.planner.decide_iteration(
+                event=event,
+                current_prompt=current_prompt,
+                score=score,
+                threshold=self.verification.threshold,
+                attempt=attempt,
+                max_retries=self.max_retries,
+                state=state,
+            )
+            state.reasoning_trace.append({
+                "attempt": attempt,
+                "action": decision["action"],
+                "reasoning": decision["reasoning"],
+                "confidence": decision["confidence"],
+                "controller_source": decision["source"],
+                "current_prompt": current_prompt,
+                "score": round(score, 4),
+                "best_score_so_far": round(state.best_score, 4),
+            })
+            print(
+                f"  -> [Agent Decision] action={decision['action']} "
+                f"source={decision['source']} confidence={decision['confidence']:.2f}"
+            )
+            print(f"  -> [Agent Reasoning] {decision['reasoning']}")
+            self.emit_event("decision_made", {
+                "timestamp_sec": event.timestamp_sec,
+                "attempt": attempt,
+                "action": decision["action"],
+                "reasoning": decision["reasoning"],
+                "confidence": decision["confidence"],
+                "controller_source": decision["source"],
+                "current_prompt": current_prompt,
+                "score": round(score, 4),
+                "best_score_so_far": round(state.best_score, 4),
+            })
+
+            if decision["action"] == "ACCEPT":
+                print("  -> [Agent] Accepting candidate for this event.")
+                state.accepted = True
+                break
+
+            if decision["action"] == "STOP_BEST":
+                print("  -> [Agent] Stopping retries and using best candidate so far.")
+                break
+
+            next_prompt = str(decision.get("next_prompt", "")).strip()
+            if decision["action"] == "RETRY_BEST" and state.best_prompt:
+                current_prompt = state.best_prompt
+            elif next_prompt:
+                current_prompt = next_prompt
+            else:
+                current_prompt = self.planner.refine_prompt(current_prompt, score)
+
+            print("  -> [Agent] Candidate rejected. Re-planning prompt.")
+
+        event.audio_file_path = state.best_audio_file_path
+        event.similarity_score = max(state.best_score, 0.0)
+        event.refined_prompt = state.best_prompt or event.original_prompt
+        event.agent_trace = state.reasoning_trace
+        self.emit_event("event_completed", {
+            "timestamp_sec": event.timestamp_sec,
+            "duration_sec": event.duration_sec,
+            "selected_prompt": event.refined_prompt,
+            "final_score": round(event.similarity_score, 4),
+            "audio_file_path": event.audio_file_path,
+            "accepted": state.accepted,
+        })
+        if not state.accepted:
+            print(
+                f"  -> [Agent] Final fallback for event at {event.timestamp_sec:.2f}s: "
+                f"best_score={state.best_score:.2f}"
+            )
+        return event
+
+    def build_run_report(
+        self,
+        input_video_path: str,
+        output_video_path: str,
+        events: List[AudioEvent],
+        vlm_log: str,
+    ) -> Dict[str, Any]:
+        return {
+            "input_video_path": input_video_path,
+            "output_video_path": output_video_path,
+            "clap_threshold": self.verification.threshold,
+            "event_count": len(events),
+            "vlm_log": vlm_log,
+            "events": [
+                {
+                    "timestamp_sec": e.timestamp_sec,
+                    "duration_sec": e.duration_sec,
+                    "original_prompt": e.original_prompt,
+                    "selected_prompt": e.refined_prompt,
+                    "final_score": e.similarity_score,
+                    "audio_file_path": e.audio_file_path,
+                    "attempts": [
+                        {
+                            "attempt": i + 1,
+                            "action": t.get("action"),
+                            "score": t.get("score"),
+                            "reasoning": t.get("reasoning"),
+                            "confidence": t.get("confidence"),
+                            "controller_source": t.get("controller_source"),
+                            "prompt": t.get("current_prompt"),
+                        }
+                        for i, t in enumerate(e.agent_trace or [])
+                    ],
+                }
+                for e in events
+            ],
+        }
+
+    def save_run_report(self, output_video_path: str, report: Dict[str, Any]) -> str:
+        base_name = os.path.splitext(os.path.basename(output_video_path))[0]
+        report_path = os.path.join(self.agent_log_dir, f"{base_name}_agent_trace.json")
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+        print(f"[Agent] Run trace saved to {report_path}")
+        return report_path
 
     def prepare_video(self, video_path: str) -> tuple[str, float, bool]:
         clip = VideoFileClip(video_path)
@@ -397,46 +691,72 @@ class FoleyOrchestrator:
 
     def run_pipeline(self, video_path: str, output_path: str):
         print(f"--- Starting Autonomous Foley Generation for {video_path} ---")
+        self.emit_event("run_started", {
+            "video_path": video_path,
+            "output_path": output_path,
+            "max_retries": self.max_retries,
+            "clap_threshold": self.verification.threshold,
+        })
         if not os.path.isabs(output_path) and os.path.dirname(output_path) == "":
             output_path = os.path.join(self.video_output_dir, output_path)
         prepared_video_path, prepared_duration, is_temp = self.prepare_video(video_path)
+        self.emit_event("video_prepared", {
+            "prepared_video_path": prepared_video_path,
+            "duration_sec": round(prepared_duration, 3),
+            "was_trimmed": is_temp,
+        })
         print(f"[Orchestrator] Using timeline duration: {prepared_duration:.2f}s")
         try:
             vlm_log = self.perception.analyze_video(prepared_video_path)
             if vlm_log.startswith("Error:"):
                 raise RuntimeError(f"Perception failed: {vlm_log}")
+            self.emit_event("perception_completed", {"vlm_log": vlm_log})
             audio_plan = self.planner.create_audio_plan(vlm_log, prepared_duration)
+            if not audio_plan:
+                print("[Agent] Planner returned no events. Injecting one ambient fallback event.")
+                audio_plan = [AudioEvent(
+                    timestamp_sec=0.0,
+                    duration_sec=prepared_duration,
+                    original_prompt="continuous ambient scene-appropriate background texture",
+                    refined_prompt=""
+                )]
+            self.emit_event("planning_completed", {
+                "event_count": len(audio_plan),
+                "events": [
+                    {
+                        "timestamp_sec": e.timestamp_sec,
+                        "duration_sec": e.duration_sec,
+                        "original_prompt": e.original_prompt,
+                    }
+                    for e in audio_plan
+                ],
+            })
 
             final_events = []
             for event in audio_plan:
-                current_prompt = event.original_prompt
-                success = False
-
-                for attempt in range(1, self.max_retries + 1):
-                    print(f"  -> Processing event at {event.timestamp_sec}s (Attempt {attempt}/{self.max_retries})")
-
-                    audio_path = self.execution.generate_audio(current_prompt, event.timestamp_sec, event.duration_sec, attempt)
-                    score = self.verification.evaluate(current_prompt, audio_path)
-
-                    if score >= self.verification.threshold:
-                        print("  -> [Critique Passed] Semantic match achieved.")
-                        event.audio_file_path = audio_path
-                        event.similarity_score = score
-                        event.refined_prompt = current_prompt
-                        success = True
-                        break
-                    else:
-                        print("  -> [Critique Failed] Semantic mismatch. Retrying...")
-                        current_prompt = self.planner.refine_prompt(current_prompt, score)
-
-                if not success:
-                    print(f"  -> [Warning] Event at {event.timestamp_sec}s failed to reach threshold after {self.max_retries} attempts. Using best effort.")
-                    event.audio_file_path = audio_path
-
-                final_events.append(event)
+                final_events.append(self.run_event_agent(event))
                 print("-" * 40)
 
             self.stitch_audio_to_video(prepared_video_path, final_events, output_path)
+            report = self.build_run_report(
+                input_video_path=video_path,
+                output_video_path=output_path,
+                events=final_events,
+                vlm_log=vlm_log,
+            )
+            report_path = self.save_run_report(output_path, report)
+            self.emit_event("run_completed", {
+                "output_video_path": output_path,
+                "report_path": report_path,
+                "event_count": len(final_events),
+            })
+        except Exception as e:
+            err = str(e)
+            self.emit_event("run_failed", {
+                "error": err,
+                "traceback": traceback.format_exc(),
+            })
+            raise
         finally:
             if is_temp and os.path.exists(prepared_video_path):
                 os.remove(prepared_video_path)
