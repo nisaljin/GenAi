@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_VLM = "Qwen/Qwen2-VL-7B-Instruct"
-DEFAULT_PLANNER = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_PLANNER = "Qwen/Qwen2.5-7B-Instruct"
 DEFAULT_EXECUTION = "facebook/audiogen-medium"
 DEFAULT_VERIFIER = "laion/clap-htsat-fused"
 

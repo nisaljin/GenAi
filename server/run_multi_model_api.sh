@@ -20,7 +20,7 @@ REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-server/requirements_multi_model_api.txt}
 # Default to Qwen2-VL 7B for speed.
 # For maximum detail, set: PERCEPTION_MODEL=Qwen/Qwen2-VL-72B-Instruct-AWQ
 PERCEPTION_MODEL="${PERCEPTION_MODEL:-Qwen/Qwen2-VL-7B-Instruct}"
-PLANNER_MODEL="${PLANNER_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+PLANNER_MODEL="${PLANNER_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 EXECUTION_MODEL="${EXECUTION_MODEL:-facebook/audiogen-medium}"
 VERIFICATION_MODEL="${VERIFICATION_MODEL:-laion/clap-htsat-fused}"
 
