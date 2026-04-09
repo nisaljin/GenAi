@@ -109,9 +109,9 @@ class ModelRegistry:
             model=self.config.perception_model,
             device_map="auto" if self.config.device == "cuda" else None,
             torch_dtype=self._torch_dtype(),
+            token=self.config.hf_token,
             model_kwargs={
                 "cache_dir": self.config.cache_dir,
-                "token": self.config.hf_token,
             },
         )
         _log(f"[load][perception] done elapsed_sec={time.time() - t0:.2f}")
@@ -157,7 +157,6 @@ class ModelRegistry:
         model = AudioGen.get_pretrained(
             self.config.execution_model,
             device=self.config.device,
-            cache_dir=self.config.cache_dir,
         )
         self._execution_model = model
         _log(f"[load][execution] done elapsed_sec={time.time() - t0:.2f}")
