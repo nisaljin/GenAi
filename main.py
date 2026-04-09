@@ -50,6 +50,8 @@ class PerceptionNode:
         raw_url = os.getenv("VLM_API_URL")
         self.api_url, self.api_url_fallback = build_endpoint(raw_url, "/perception", "/api/generate")
         self.max_frames = int(os.getenv("MAX_PERCEPTION_FRAMES", "12"))
+        self.center_crop = os.getenv("PERCEPTION_CENTER_CROP", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.resize_to = int(os.getenv("PERCEPTION_RESIZE_TO", "896"))
 
     def extract_keyframes(self, video_path: str, threshold: float = 15.0) -> List[Dict[str, Any]]:
         vidcap = cv2.VideoCapture(video_path)
@@ -85,8 +87,26 @@ class PerceptionNode:
         print(f"[Perception Node] Extracted {len(frames)} pertinent keyframes.")
         return frames
 
+    def preprocess_frame(self, image: np.ndarray) -> np.ndarray:
+        processed = image
+        if self.center_crop:
+            h, w = processed.shape[:2]
+            side = min(h, w)
+            top = (h - side) // 2
+            left = (w - side) // 2
+            processed = processed[top:top + side, left:left + side]
+
+        if self.resize_to > 0:
+            processed = cv2.resize(
+                processed,
+                (self.resize_to, self.resize_to),
+                interpolation=cv2.INTER_AREA,
+            )
+        return processed
+
     def encode_image_to_base64(self, image: np.ndarray) -> str:
-        _, buffer = cv2.imencode('.jpg', image)
+        processed = self.preprocess_frame(image)
+        _, buffer = cv2.imencode('.jpg', processed)
         return base64.b64encode(buffer).decode('utf-8')
 
     def analyze_video(self, video_path: str) -> str:

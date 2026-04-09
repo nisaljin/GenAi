@@ -364,6 +364,19 @@ def build_app(registry: ModelRegistry) -> FastAPI:
             model = registry.load_execution()
             model.set_generation_params(duration=float(req.duration))
             wav = model.generate([req.prompt])[0].cpu().numpy()
+            wav = np.asarray(wav)
+
+            # AudioGen may return (channels, samples) or (samples, channels).
+            # Normalize to mono 1D samples for stable WAV writing.
+            if wav.ndim == 2:
+                if wav.shape[0] <= 8 and wav.shape[1] > wav.shape[0]:
+                    wav = wav.mean(axis=0)
+                elif wav.shape[1] <= 8 and wav.shape[0] > wav.shape[1]:
+                    wav = wav.mean(axis=1)
+                else:
+                    wav = wav.reshape(-1)
+            elif wav.ndim > 2:
+                wav = wav.reshape(-1)
 
             max_val = np.max(np.abs(wav))
             if max_val > 0:
