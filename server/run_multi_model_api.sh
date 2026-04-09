@@ -16,6 +16,7 @@ PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 INSTALL_APT_DEPS="${INSTALL_APT_DEPS:-1}"
 INSTALL_PIP_DEPS="${INSTALL_PIP_DEPS:-1}"
 REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-server/requirements_multi_model_api.txt}"
+WARMUP_ON_START="${WARMUP_ON_START:-0}"
 
 # Default to Qwen2-VL 7B for speed.
 # For maximum detail, set: PERCEPTION_MODEL=Qwen/Qwen2-VL-72B-Instruct-AWQ
@@ -34,6 +35,7 @@ echo "[runner] perception_model=${PERCEPTION_MODEL}"
 echo "[runner] planner_model=${PLANNER_MODEL}"
 echo "[runner] execution_model=${EXECUTION_MODEL}"
 echo "[runner] verification_model=${VERIFICATION_MODEL}"
+echo "[runner] warmup_on_start=${WARMUP_ON_START}"
 echo "[runner] cache_size_before=$(du -sh "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')"
 
 if [[ "${INSTALL_APT_DEPS}" == "1" ]]; then
@@ -62,12 +64,19 @@ if [[ "${INSTALL_PIP_DEPS}" == "1" ]]; then
   python -m pip install -r "${REQUIREMENTS_FILE}"
 fi
 
-python server/multi_model_api.py \
-  --host "${HOST}" \
-  --port "${PORT}" \
-  --cache-dir "${CACHE_DIR}" \
-  --perception-model "${PERCEPTION_MODEL}" \
-  --planner-model "${PLANNER_MODEL}" \
-  --execution-model "${EXECUTION_MODEL}" \
-  --verification-model "${VERIFICATION_MODEL}" \
-  --warmup
+CMD=(
+  python server/multi_model_api.py
+  --host "${HOST}"
+  --port "${PORT}"
+  --cache-dir "${CACHE_DIR}"
+  --perception-model "${PERCEPTION_MODEL}"
+  --planner-model "${PLANNER_MODEL}"
+  --execution-model "${EXECUTION_MODEL}"
+  --verification-model "${VERIFICATION_MODEL}"
+)
+
+if [[ "${WARMUP_ON_START}" == "1" ]]; then
+  CMD+=(--warmup)
+fi
+
+"${CMD[@]}"

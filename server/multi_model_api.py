@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gc
 import io
 import json
 import os
@@ -83,6 +84,7 @@ class RuntimeConfig:
     verification_model: str
     device: str
     dtype: torch.dtype
+    offload_after_use: bool
 
 
 class ModelRegistry:
@@ -186,6 +188,32 @@ class ModelRegistry:
         _log(f"[load][verification] done elapsed_sec={time.time() - t0:.2f}")
         return processor, model
 
+    def _clear_cuda_cache(self) -> None:
+        if self.config.device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def unload_perception(self) -> None:
+        self._perception_pipe = None
+        gc.collect()
+        self._clear_cuda_cache()
+
+    def unload_planner(self) -> None:
+        self._planner_tokenizer = None
+        self._planner_model = None
+        gc.collect()
+        self._clear_cuda_cache()
+
+    def unload_execution(self) -> None:
+        self._execution_model = None
+        gc.collect()
+        self._clear_cuda_cache()
+
+    def unload_verification(self) -> None:
+        self._verification_processor = None
+        self._verification_model = None
+        gc.collect()
+        self._clear_cuda_cache()
+
     def warmup_all(self) -> dict[str, str]:
         status: dict[str, str] = {}
         for name, loader in (
@@ -275,6 +303,10 @@ def build_app(registry: ModelRegistry) -> FastAPI:
         except Exception as exc:
             _log(f"[error][perception] {exc}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            if registry.config.offload_after_use:
+                _log("[offload][perception] unloading model from memory")
+                registry.unload_perception()
 
     @app.post("/planner")
     def planner(req: PlannerRequest) -> dict[str, Any]:
@@ -318,6 +350,10 @@ def build_app(registry: ModelRegistry) -> FastAPI:
         except Exception as exc:
             _log(f"[error][planner] {exc}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            if registry.config.offload_after_use:
+                _log("[offload][planner] unloading model from memory")
+                registry.unload_planner()
 
     @app.post("/execution")
     def execution(req: ExecutionRequest) -> dict[str, Any]:
@@ -343,6 +379,10 @@ def build_app(registry: ModelRegistry) -> FastAPI:
         except Exception as exc:
             _log(f"[error][execution] {exc}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            if registry.config.offload_after_use:
+                _log("[offload][execution] unloading model from memory")
+                registry.unload_execution()
 
     @app.post("/verification")
     def verification(req: VerificationRequest) -> dict[str, Any]:
@@ -370,6 +410,10 @@ def build_app(registry: ModelRegistry) -> FastAPI:
         except Exception as exc:
             _log(f"[error][verification] {exc}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            if registry.config.offload_after_use:
+                _log("[offload][verification] unloading model from memory")
+                registry.unload_verification()
 
     return app
 
@@ -388,6 +432,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--planner-model", default=os.getenv("PLANNER_MODEL", DEFAULT_PLANNER))
     parser.add_argument("--execution-model", default=os.getenv("EXECUTION_MODEL", DEFAULT_EXECUTION))
     parser.add_argument("--verification-model", default=os.getenv("VERIFICATION_MODEL", DEFAULT_VERIFIER))
+    parser.add_argument(
+        "--offload-after-use",
+        action="store_true",
+        default=os.getenv("OFFLOAD_AFTER_USE", "1").strip().lower() in {"1", "true", "yes", "on"},
+        help="Unload each stage model after every request to reduce VRAM pressure.",
+    )
+    parser.add_argument(
+        "--no-offload-after-use",
+        action="store_false",
+        dest="offload_after_use",
+        help="Keep models resident in memory between requests.",
+    )
     parser.add_argument("--uvicorn-log-level", default=os.getenv("UVICORN_LOG_LEVEL", "info"))
     parser.add_argument(
         "--warmup",
@@ -415,6 +471,7 @@ def main() -> None:
         verification_model=args.verification_model,
         device=device,
         dtype=dtype,
+        offload_after_use=args.offload_after_use,
     )
 
     _log("[startup] Multi-model Foley API configuration")
@@ -424,6 +481,7 @@ def main() -> None:
     _log(f"[startup] planner_model={config.planner_model}")
     _log(f"[startup] execution_model={config.execution_model}")
     _log(f"[startup] verification_model={config.verification_model}")
+    _log(f"[startup] offload_after_use={config.offload_after_use}")
     _log(f"[startup] uvicorn_log_level={args.uvicorn_log_level}")
 
     registry = ModelRegistry(config)
