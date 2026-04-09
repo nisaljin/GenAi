@@ -1,4 +1,0 @@
-timestamp=0.00 attempt=1 duration=2.00
-prompt=Describe only sound-relevant events and materials in this frame for Foley design. Keep it concise.
-output=generated_audio/event_0.0_v1.wav
---------------------------------------------------------------------------------
