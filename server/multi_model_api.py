@@ -7,6 +7,7 @@ import io
 import json
 import os
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any
 
@@ -272,6 +273,7 @@ def build_app(registry: ModelRegistry) -> FastAPI:
         except HTTPException:
             raise
         except Exception as exc:
+            _log(f"[error][perception] {exc}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/planner")
@@ -314,6 +316,7 @@ def build_app(registry: ModelRegistry) -> FastAPI:
 
             return {"raw": raw, "parsed": parsed}
         except Exception as exc:
+            _log(f"[error][planner] {exc}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/execution")
@@ -338,6 +341,7 @@ def build_app(registry: ModelRegistry) -> FastAPI:
         except HTTPException:
             raise
         except Exception as exc:
+            _log(f"[error][execution] {exc}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/verification")
@@ -364,6 +368,7 @@ def build_app(registry: ModelRegistry) -> FastAPI:
 
             return {"similarity_score": score}
         except Exception as exc:
+            _log(f"[error][verification] {exc}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return app
@@ -383,6 +388,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--planner-model", default=os.getenv("PLANNER_MODEL", DEFAULT_PLANNER))
     parser.add_argument("--execution-model", default=os.getenv("EXECUTION_MODEL", DEFAULT_EXECUTION))
     parser.add_argument("--verification-model", default=os.getenv("VERIFICATION_MODEL", DEFAULT_VERIFIER))
+    parser.add_argument("--uvicorn-log-level", default=os.getenv("UVICORN_LOG_LEVEL", "info"))
     parser.add_argument(
         "--warmup",
         action="store_true",
@@ -418,6 +424,7 @@ def main() -> None:
     _log(f"[startup] planner_model={config.planner_model}")
     _log(f"[startup] execution_model={config.execution_model}")
     _log(f"[startup] verification_model={config.verification_model}")
+    _log(f"[startup] uvicorn_log_level={args.uvicorn_log_level}")
 
     registry = ModelRegistry(config)
     app = build_app(registry)
@@ -427,7 +434,7 @@ def main() -> None:
         status = registry.warmup_all()
         _log(f"[warmup] {status}")
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.uvicorn_log_level)
 
 
 if __name__ == "__main__":

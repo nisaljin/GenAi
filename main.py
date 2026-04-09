@@ -14,6 +14,19 @@ from groq import Groq
 # Load environment variables from .env file
 load_dotenv()
 
+
+def build_endpoint(base_url: str, preferred_path: str, fallback_path: str = "") -> tuple[str, str]:
+    base = base_url.rstrip("/")
+    if base.endswith(preferred_path):
+        fallback = (base[: -len(preferred_path)] + fallback_path) if fallback_path else ""
+        return base, fallback
+    if fallback_path and base.endswith(fallback_path):
+        preferred = base[: -len(fallback_path)] + preferred_path
+        return preferred, base
+    preferred = f"{base}{preferred_path}"
+    fallback = f"{base}{fallback_path}" if fallback_path else ""
+    return preferred, fallback
+
 # ==========================================
 # Data Structures
 # ==========================================
@@ -34,7 +47,9 @@ class AudioEvent:
 class PerceptionNode:
     def __init__(self):
         self.model_name = os.getenv("VLM_MODEL_NAME", "llava")
-        self.api_url = os.getenv("VLM_API_URL")
+        raw_url = os.getenv("VLM_API_URL")
+        self.api_url, self.api_url_fallback = build_endpoint(raw_url, "/perception", "/api/generate")
+        self.max_frames = int(os.getenv("MAX_PERCEPTION_FRAMES", "12"))
 
     def extract_keyframes(self, video_path: str, threshold: float = 15.0) -> List[Dict[str, Any]]:
         vidcap = cv2.VideoCapture(video_path)
@@ -76,6 +91,14 @@ class PerceptionNode:
 
     def analyze_video(self, video_path: str) -> str:
         keyframes = self.extract_keyframes(video_path, threshold=15.0)
+        if len(keyframes) > self.max_frames:
+            step = max(len(keyframes) // self.max_frames, 1)
+            sampled = keyframes[::step][:self.max_frames]
+            print(
+                f"[Perception Node] Downsampling keyframes {len(keyframes)} -> {len(sampled)} "
+                f"(MAX_PERCEPTION_FRAMES={self.max_frames})."
+            )
+            keyframes = sampled
         
         if not keyframes:
             return "Error: No frames could be extracted from the video."
@@ -99,7 +122,11 @@ class PerceptionNode:
 
         print(f"[Perception Node] Sending {len(images_base64)} frames to VLM ({self.model_name})...")
 
-        payload = {
+        payload_multi = {
+            "images_base64": images_base64,
+            "prompt": full_prompt,
+        }
+        payload_legacy = {
             "model": self.model_name,
             "prompt": full_prompt,
             "images": images_base64,
@@ -107,14 +134,18 @@ class PerceptionNode:
         }
 
         try:
-            response = requests.post(self.api_url, json=payload)
-            response.raise_for_status()
-            vlm_log = response.json().get("response", "")
+            response = requests.post(self.api_url, json=payload_multi)
+            if response.status_code == 404 and self.api_url_fallback:
+                response = requests.post(self.api_url_fallback, json=payload_legacy)
+            if not response.ok:
+                raise RuntimeError(f"Perception API error {response.status_code}: {response.text}")
+            body = response.json()
+            vlm_log = body.get("vlm_log") or body.get("response", "")
             
             print(f"[Perception Node] Successfully generated VLM Log.")
             return vlm_log
             
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             print(f"[Perception Node] API Error: {e}")
             return "Error: Failed to reach VLM."
 
@@ -152,7 +183,7 @@ class PlannerNode:
             # Map the new duration variable
             events = [AudioEvent(
                 timestamp_sec=e["timestamp_sec"], 
-                duration_sec=e.get("duration_sec", 2.0),
+                duration_sec=max(float(e.get("duration_sec", 2.0)), 0.5),
                 original_prompt=e["original_prompt"], 
                 refined_prompt=""
             ) for e in events_data]
@@ -186,16 +217,19 @@ class PlannerNode:
 class ExecutionNode:
     def __init__(self):
         base_url = os.getenv("AUDIO_API_URL").rstrip('/')
-        self.api_url = f"{base_url}/generate"
+        self.api_url, self.api_url_fallback = build_endpoint(base_url, "/execution", "/generate")
         self.output_dir = "./generated_audio"
         os.makedirs(self.output_dir, exist_ok=True)
 
     def generate_audio(self, prompt: str, timestamp: float, duration: float, attempt: int) -> str:
-        print(f"[Execution Node] Requesting {duration}s audio for: '{prompt[:40]}...'")
+        safe_duration = max(float(duration), 0.5)
+        print(f"[Execution Node] Requesting {safe_duration}s audio for: '{prompt[:40]}...'")
         
-        # Send the duration variable to the RunPod server
-        response = requests.post(self.api_url, json={"prompt": prompt, "duration": duration})
-        response.raise_for_status()
+        response = requests.post(self.api_url, json={"prompt": prompt, "duration": safe_duration})
+        if response.status_code == 404 and self.api_url_fallback:
+            response = requests.post(self.api_url_fallback, json={"prompt": prompt, "duration": safe_duration})
+        if not response.ok:
+            raise RuntimeError(f"Execution API error {response.status_code}: {response.text}")
         
         b64_audio = response.json().get("audio_base64")
         file_path = f"{self.output_dir}/event_{timestamp}_v{attempt}.wav"
@@ -214,14 +248,17 @@ class VerificationNode:
     def __init__(self, threshold: float = 0.50): # Lowered threshold slightly for real models
         self.threshold = threshold
         base_url = os.getenv("AUDIO_API_URL").rstrip('/')
-        self.api_url = f"{base_url}/evaluate"
+        self.api_url, self.api_url_fallback = build_endpoint(base_url, "/verification", "/evaluate")
 
     def evaluate(self, prompt: str, audio_path: str) -> float:
         with open(audio_path, "rb") as fh:
             b64_audio = base64.b64encode(fh.read()).decode('utf-8')
             
         response = requests.post(self.api_url, json={"prompt": prompt, "audio_base64": b64_audio})
-        response.raise_for_status()
+        if response.status_code == 404 and self.api_url_fallback:
+            response = requests.post(self.api_url_fallback, json={"prompt": prompt, "audio_base64": b64_audio})
+        if not response.ok:
+            raise RuntimeError(f"Verification API error {response.status_code}: {response.text}")
         
         score = response.json().get("similarity_score", 0.0)
         print(f"[Verification Node] CLAP Score: {score:.2f} for '{prompt[:40]}...'")
@@ -265,6 +302,8 @@ class FoleyOrchestrator:
         print(f"--- Starting Autonomous Foley Generation for {video_path} ---")
         
         vlm_log = self.perception.analyze_video(video_path)
+        if vlm_log.startswith("Error:"):
+            raise RuntimeError(f"Perception failed: {vlm_log}")
         audio_plan = self.planner.create_audio_plan(vlm_log)
         
         final_events = []
