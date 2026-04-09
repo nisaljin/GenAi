@@ -5,6 +5,7 @@ import base64
 import shutil
 import subprocess
 import traceback
+import time
 import numpy as np
 import requests
 from pydub import AudioSegment
@@ -75,13 +76,22 @@ class EventAgentState:
 # ==========================================
 
 class PerceptionNode:
-    def __init__(self):
+    def __init__(self, event_emitter: Optional[Callable[[str, Dict[str, Any]], None]] = None):
         self.model_name = os.getenv("VLM_MODEL_NAME", "llava")
         raw_url = os.getenv("VLM_API_URL")
         self.api_url, self.api_url_fallback = build_endpoint(raw_url, "/perception", "/api/generate")
         self.max_frames = int(os.getenv("MAX_PERCEPTION_FRAMES", "12"))
         self.center_crop = os.getenv("PERCEPTION_CENTER_CROP", "1").strip().lower() in {"1", "true", "yes", "on"}
         self.resize_to = int(os.getenv("PERCEPTION_RESIZE_TO", "896"))
+        self.event_emitter = event_emitter
+
+    def emit(self, event_type: str, payload: Dict[str, Any]) -> None:
+        if not self.event_emitter:
+            return
+        try:
+            self.event_emitter(event_type, payload)
+        except Exception:
+            pass
 
     def extract_keyframes(self, video_path: str, threshold: float = 15.0) -> List[Dict[str, Any]]:
         vidcap = cv2.VideoCapture(video_path)
@@ -115,6 +125,10 @@ class PerceptionNode:
             
         vidcap.release()
         print(f"[Perception Node] Extracted {len(frames)} pertinent keyframes.")
+        self.emit("vlm_keyframes_extracted", {
+            "keyframe_count": len(frames),
+            "threshold": threshold,
+        })
         return frames
 
     def preprocess_frame(self, image: np.ndarray) -> np.ndarray:
@@ -148,16 +162,34 @@ class PerceptionNode:
                 f"[Perception Node] Downsampling keyframes {len(keyframes)} -> {len(sampled)} "
                 f"(MAX_PERCEPTION_FRAMES={self.max_frames})."
             )
+            self.emit("vlm_keyframes_downsampled", {
+                "before": len(keyframes),
+                "after": len(sampled),
+                "max_frames": self.max_frames,
+            })
             keyframes = sampled
         
         if not keyframes:
             return "Error: No frames could be extracted from the video."
 
+        timeline_end = round(float(keyframes[-1]["timestamp"]), 2) if keyframes else 0.0
         system_prompt = (
             "You are an expert Foley artist and sound designer. "
-            "I will provide you with a sequence of frames from a silent video. "
-            "Describe the physical interactions, materials, and potential sounds in chronological order. "
-            "Output the log with timestamps in this format: [0.0s] description of action."
+            "You will receive sampled frames from a silent video with known timestamps. "
+            "Produce a detailed SOUND timeline with explicit time ranges and acoustic cues.\n\n"
+            "STRICT FORMAT RULES:\n"
+            "1) Return plain text only (no markdown, no JSON).\n"
+            "2) One cue per line.\n"
+            "3) Every line MUST start with [start-end] in seconds, e.g. [5.0-8.0].\n"
+            "4) Include at least one continuous background/bed ambience cue spanning most of the clip.\n"
+            "5) Include discrete foreground cues when visible actions change.\n"
+            "6) Use acoustic language (texture, material, intensity, distance, motion).\n"
+            f"7) Keep all ranges inside [0.0-{timeline_end}s].\n\n"
+            "EXAMPLE STYLE:\n"
+            "[0.0-15.0] Forest bed ambience: light wind through leaves, distant soft rustle.\n"
+            "[2.5-4.0] Footstep crunch on dry twigs near camera, medium intensity.\n"
+            "[5.0-8.0] Bird chirps from upper-left canopy, intermittent and bright.\n"
+            "[9.0-12.0] Branch swish as subject passes foliage, close and airy."
         )
 
         images_base64 = []
@@ -168,9 +200,21 @@ class PerceptionNode:
             images_base64.append(b64_img)
             timestamp_context += f"Image {idx+1}: [{kf['timestamp']}s]\n"
 
-        full_prompt = f"{system_prompt}\n\n{timestamp_context}"
+        full_prompt = (
+            f"{system_prompt}\n\n"
+            f"{timestamp_context}\n"
+            "Now generate the timeline using the strict format."
+        )
+        frame_timestamps = [kf["timestamp"] for kf in keyframes]
 
         print(f"[Perception Node] Sending {len(images_base64)} frames to VLM ({self.model_name})...")
+        self.emit("vlm_request_started", {
+            "model": self.model_name,
+            "frame_count": len(images_base64),
+            "frame_timestamps": frame_timestamps,
+            "endpoint": self.api_url,
+            "fallback_endpoint": self.api_url_fallback,
+        })
 
         payload_multi = {
             "images_base64": images_base64,
@@ -193,10 +237,18 @@ class PerceptionNode:
             vlm_log = body.get("vlm_log") or body.get("response", "")
             
             print(f"[Perception Node] Successfully generated VLM Log.")
+            self.emit("vlm_response_received", {
+                "model": self.model_name,
+                "log_length": len(vlm_log),
+                "preview": vlm_log[:500],
+            })
             return vlm_log
             
         except Exception as e:
             print(f"[Perception Node] API Error: {e}")
+            self.emit("vlm_request_failed", {
+                "error": str(e),
+            })
             return "Error: Failed to reach VLM."
 
 # ==========================================
@@ -432,7 +484,7 @@ class VerificationNode:
 
 class FoleyOrchestrator:
     def __init__(self, event_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
-        self.perception = PerceptionNode()
+        self.perception = PerceptionNode(event_emitter=self.emit_event)
         self.planner = PlannerNode()
         self.execution = ExecutionNode()
         self.verification = VerificationNode(threshold=0.50)
@@ -689,14 +741,18 @@ class FoleyOrchestrator:
         os.remove(temp_audio_path)
         print(f"[Stitcher] Success! Final video saved to {output_path}")
 
-    def run_pipeline(self, video_path: str, output_path: str):
+    def run_pipeline(self, video_path: str, output_path: str, prompt: str = ""):
         print(f"--- Starting Autonomous Foley Generation for {video_path} ---")
         self.emit_event("run_started", {
+            "mode": "video",
             "video_path": video_path,
             "output_path": output_path,
+            "prompt": prompt,
             "max_retries": self.max_retries,
             "clap_threshold": self.verification.threshold,
         })
+        if not output_path:
+            output_path = f"foley_video_{int(time.time())}.mp4"
         if not os.path.isabs(output_path) and os.path.dirname(output_path) == "":
             output_path = os.path.join(self.video_output_dir, output_path)
         prepared_video_path, prepared_duration, is_temp = self.prepare_video(video_path)
@@ -707,30 +763,50 @@ class FoleyOrchestrator:
         })
         print(f"[Orchestrator] Using timeline duration: {prepared_duration:.2f}s")
         try:
-            vlm_log = self.perception.analyze_video(prepared_video_path)
-            if vlm_log.startswith("Error:"):
-                raise RuntimeError(f"Perception failed: {vlm_log}")
-            self.emit_event("perception_completed", {"vlm_log": vlm_log})
-            audio_plan = self.planner.create_audio_plan(vlm_log, prepared_duration)
-            if not audio_plan:
-                print("[Agent] Planner returned no events. Injecting one ambient fallback event.")
+            vlm_log = ""
+            if prompt.strip():
                 audio_plan = [AudioEvent(
                     timestamp_sec=0.0,
                     duration_sec=prepared_duration,
-                    original_prompt="continuous ambient scene-appropriate background texture",
+                    original_prompt=prompt.strip(),
                     refined_prompt=""
                 )]
-            self.emit_event("planning_completed", {
-                "event_count": len(audio_plan),
-                "events": [
-                    {
-                        "timestamp_sec": e.timestamp_sec,
-                        "duration_sec": e.duration_sec,
-                        "original_prompt": e.original_prompt,
-                    }
-                    for e in audio_plan
-                ],
-            })
+                self.emit_event("planning_completed", {
+                    "event_count": len(audio_plan),
+                    "mode": "prompt_override",
+                    "events": [
+                        {
+                            "timestamp_sec": audio_plan[0].timestamp_sec,
+                            "duration_sec": audio_plan[0].duration_sec,
+                            "original_prompt": audio_plan[0].original_prompt,
+                        }
+                    ],
+                })
+            else:
+                vlm_log = self.perception.analyze_video(prepared_video_path)
+                if vlm_log.startswith("Error:"):
+                    raise RuntimeError(f"Perception failed: {vlm_log}")
+                self.emit_event("perception_completed", {"vlm_log": vlm_log})
+                audio_plan = self.planner.create_audio_plan(vlm_log, prepared_duration)
+                if not audio_plan:
+                    print("[Agent] Planner returned no events. Injecting one ambient fallback event.")
+                    audio_plan = [AudioEvent(
+                        timestamp_sec=0.0,
+                        duration_sec=prepared_duration,
+                        original_prompt="continuous ambient scene-appropriate background texture",
+                        refined_prompt=""
+                    )]
+                self.emit_event("planning_completed", {
+                    "event_count": len(audio_plan),
+                    "events": [
+                        {
+                            "timestamp_sec": e.timestamp_sec,
+                            "duration_sec": e.duration_sec,
+                            "original_prompt": e.original_prompt,
+                        }
+                        for e in audio_plan
+                    ],
+                })
 
             final_events = []
             for event in audio_plan:
@@ -746,6 +822,7 @@ class FoleyOrchestrator:
             )
             report_path = self.save_run_report(output_path, report)
             self.emit_event("run_completed", {
+                "mode": "video",
                 "output_video_path": output_path,
                 "report_path": report_path,
                 "event_count": len(final_events),
@@ -760,6 +837,67 @@ class FoleyOrchestrator:
         finally:
             if is_temp and os.path.exists(prepared_video_path):
                 os.remove(prepared_video_path)
+
+    def run_audio_only(self, prompt: str, output_audio_path: str = ""):
+        clean_prompt = prompt.strip()
+        if not clean_prompt:
+            raise ValueError("Prompt is required for audio-only generation.")
+
+        default_duration = float(os.getenv("PROMPT_ONLY_DURATION_SEC", "6"))
+        safe_duration = max(default_duration, 0.5)
+
+        self.emit_event("run_started", {
+            "mode": "audio_only",
+            "prompt": clean_prompt,
+            "max_retries": self.max_retries,
+            "clap_threshold": self.verification.threshold,
+        })
+        event = AudioEvent(
+            timestamp_sec=0.0,
+            duration_sec=safe_duration,
+            original_prompt=clean_prompt,
+            refined_prompt="",
+        )
+        self.emit_event("planning_completed", {
+            "mode": "audio_only",
+            "event_count": 1,
+            "events": [
+                {
+                    "timestamp_sec": 0.0,
+                    "duration_sec": safe_duration,
+                    "original_prompt": clean_prompt,
+                }
+            ],
+        })
+
+        final_event = self.run_event_agent(event)
+        if not final_event.audio_file_path or not os.path.exists(final_event.audio_file_path):
+            raise RuntimeError("Audio generation failed to produce an output file.")
+
+        if not output_audio_path:
+            output_audio_path = os.path.join(
+                self.execution.output_dir,
+                f"foley_audio_{int(time.time())}.wav",
+            )
+        elif not os.path.isabs(output_audio_path):
+            output_audio_path = os.path.join(self.execution.output_dir, output_audio_path)
+
+        if os.path.abspath(final_event.audio_file_path) != os.path.abspath(output_audio_path):
+            shutil.copyfile(final_event.audio_file_path, output_audio_path)
+
+        report = self.build_run_report(
+            input_video_path="",
+            output_video_path=output_audio_path,
+            events=[final_event],
+            vlm_log="",
+        )
+        report_path = self.save_run_report(output_audio_path, report)
+        self.emit_event("run_completed", {
+            "mode": "audio_only",
+            "output_audio_path": output_audio_path,
+            "report_path": report_path,
+            "event_count": 1,
+        })
 
 # ==========================================
 # Execution Entry Point
