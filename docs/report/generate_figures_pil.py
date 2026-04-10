@@ -1,4 +1,5 @@
 from pathlib import Path
+import textwrap
 from PIL import Image, ImageDraw, ImageFont
 
 OUT = Path('docs/report/assets')
@@ -23,11 +24,38 @@ def rounded_box(draw, box, fill):
     draw.rounded_rectangle(box, radius=18, fill=fill, outline='black', width=3)
 
 
+def _wrap_text_to_px(draw, text, font, max_px):
+    words = text.replace("\n", " ").split()
+    lines = []
+    current = []
+    for w in words:
+        candidate = " ".join(current + [w]).strip()
+        l, t, r, b = draw.textbbox((0, 0), candidate, font=font)
+        if (r - l) <= max_px or not current:
+            current.append(w)
+        else:
+            lines.append(" ".join(current))
+            current = [w]
+    if current:
+        lines.append(" ".join(current))
+    return "\n".join(lines)
+
+
 def draw_text_block(draw, box, title, body, title_font, body_font):
     x1, y1, x2, y2 = box
-    draw.multiline_text((x1 + 26, y1 + 18), title, font=title_font, fill='black', spacing=6)
+    pad_x = 24
+    pad_y = 18
+    max_width = (x2 - x1) - 2 * pad_x
+
+    title_wrapped = _wrap_text_to_px(draw, title, title_font, max_width)
+    title_pos = (x1 + pad_x, y1 + pad_y)
+    draw.multiline_text(title_pos, title_wrapped, font=title_font, fill='black', spacing=5)
+
     if body:
-        draw.multiline_text((x1 + 26, y1 + 86), body, font=body_font, fill='black', spacing=7)
+        l, t, r, b = draw.multiline_textbbox(title_pos, title_wrapped, font=title_font, spacing=5)
+        body_wrapped = _wrap_text_to_px(draw, body, body_font, max_width)
+        body_pos = (x1 + pad_x, b + 12)
+        draw.multiline_text(body_pos, body_wrapped, font=body_font, fill='black', spacing=6)
 
 
 def center(box):
@@ -134,8 +162,8 @@ d2 = ImageDraw.Draw(img2)
 
 d2.text((80, 48), 'Per-Event Agentic Decision Loop', font=f_title, fill='black')
 
-f_node_title2 = load_font(56, True)
-f_node_body2 = load_font(32, False)
+f_node_title2 = load_font(50, True)
+f_node_body2 = load_font(28, False)
 f_edge2 = load_font(34, False)
 
 start = (760, 220, 1640, 480)
@@ -157,44 +185,44 @@ d2.polygon(diamond, fill='#f2edd6', outline='black', width=3)
 
 draw_text_block(
     d2, start, 'Start Event',
-    'Input: planned event and\nretry budget.',
+    'Input: planned event and retry budget.',
     f_node_title2, f_node_body2
 )
 draw_text_block(
-    d2, gen, 'Generate Audio\nCandidate',
-    'Action: synthesize WAV from\ncurrent prompt and duration.',
+    d2, gen, 'Generate Audio Candidate',
+    'Action: synthesize WAV from current prompt and duration.',
     f_node_title2, f_node_body2
 )
 draw_text_block(
-    d2, verif, 'Dual CLAP\nVerification',
-    'Output: score_primary,\nscore_secondary, score_gap.',
+    d2, verif, 'Dual CLAP Verification',
+    'Output: score_primary, score_secondary, score_gap.',
     f_node_title2, f_node_body2
 )
 draw_text_block(
-    d2, xmod, 'Cross-Modal\nAgreement Check',
-    'Compares prompt tokens with\nscene-derived expected cues.',
+    d2, xmod, 'Cross-Modal Agreement Check',
+    'Compares prompt tokens with scene-derived expected cues.',
     f_node_title2, f_node_body2
 )
 draw_text_block(
-    d2, accept, 'Accept\nCandidate',
-    'Commit selected audio\nfor this event.',
+    d2, accept, 'Accept Candidate',
+    'Commit selected audio for this event.',
     f_node_title2, f_node_body2
 )
 draw_text_block(
-    d2, rewrite, 'Rewrite Prompt\nand Retry',
-    'Use controller-suggested\nor refined next prompt.',
+    d2, rewrite, 'Rewrite Prompt and Retry',
+    'Use controller-suggested or refined next prompt.',
     f_node_title2, f_node_body2
 )
 draw_text_block(
-    d2, stop, 'Stop and Use\nBest So Far',
-    'Terminate retries and keep\nhighest-quality candidate.',
+    d2, stop, 'Stop and Use Best So Far',
+    'Terminate retries and keep highest-quality candidate.',
     f_node_title2, f_node_body2
 )
 d2.multiline_text((1030, 2195), 'Controller\nDecision', font=f_node_title2, fill='black', spacing=8)
 draw_text_block(
     d2, callout, 'Uncertainty Gate',
-    'If verifier disagreement or\ncross-modal mismatch is high,\nACCEPT can be blocked and\nforced to retry/stop-best.',
-    load_font(48, True), f_node_body2
+    'If verifier disagreement or cross-modal mismatch is high, ACCEPT can be blocked and forced to retry/stop-best.',
+    load_font(42, True), f_node_body2
 )
 
 # vertical main flow

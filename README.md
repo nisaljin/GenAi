@@ -2,6 +2,12 @@
 
 Agentic pipeline that generates Foley audio from video (or prompt-only), scores quality with CLAP, and iteratively retries/refines until acceptance criteria are met.
 
+## Prerequisites
+
+- Python `3.10+` (tested with Python `3.12`)
+- Node.js `18+` and npm
+- `ffmpeg` available on `PATH` (required for robust video/audio muxing)
+
 ## Repo Structure
 
 - `main.py`: core orchestration and agentic loop.
@@ -10,26 +16,70 @@ Agentic pipeline that generates Foley audio from video (or prompt-only), scores 
 - `notebooks/`: teammate-facing deep-dive + stage test notebook.
 - `scripts/`: stage tests and helper scripts.
 
-## Quick Start
+## Environment Setup
 
-1. Start model API:
+1. Create and activate a Python virtual environment at repo root:
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+2. Install backend requirements once:
+```bash
+python -m pip install -r server/requirements_multi_model_api.txt
+python -m pip install -r server/requirements.txt
+```
+
+3. Install frontend dependencies:
+```bash
+cd web
+npm install
+cd ..
+```
+
+4. Create your runtime env file:
+```bash
+cp .env.example .env
+```
+Then edit `.env` with your own keys and endpoint values.
+
+## Run (3 terminals)
+
+Use a separate terminal for each process.
+
+Terminal 1:
+```bash
+source .venv/bin/activate
 ./server/run_multi_model_api.sh
 ```
 
-2. Start WebSocket bridge:
+Terminal 2:
 ```bash
+source .venv/bin/activate
 ./server/run_agent_ws_api.sh
 ```
 
-3. Start frontend:
+Terminal 3:
 ```bash
 cd web
 npm run dev
 ```
 
-4. Open:
+Open:
 `http://localhost:3000`
+
+## Script Behavior Notes
+
+- `./server/run_multi_model_api.sh`:
+  - loads `.env` automatically if present,
+  - installs apt deps on Linux if `apt` exists (`INSTALL_APT_DEPS=1` by default),
+  - installs pip deps from `server/requirements_multi_model_api.txt` by default (`INSTALL_PIP_DEPS=1`).
+- If you already installed dependencies manually, run:
+```bash
+INSTALL_APT_DEPS=0 INSTALL_PIP_DEPS=0 ./server/run_multi_model_api.sh
+```
+- `./server/run_agent_ws_api.sh` automatically activates `.venv` if available.
 
 ## Key Endpoints
 
