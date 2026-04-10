@@ -20,15 +20,14 @@ Agentic pipeline that generates Foley audio from video (or prompt-only), scores 
 
 1. Create and activate a Python virtual environment at repo root:
 ```bash
-python3 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 ```
 
-2. Install backend requirements once:
+2. Install local backend requirements (WS bridge + orchestrator) only:
 ```bash
-python -m pip install -r server/requirements_multi_model_api.txt
-python -m pip install -r server/requirements.txt
+python -m pip install -r server/requirements_agent_ws_api.txt
 ```
 
 3. Install frontend dependencies:
@@ -44,23 +43,22 @@ cp .env.example .env
 ```
 Then edit `.env` with your own keys and endpoint values.
 
-## Run (3 terminals)
+## Default Run Mode (Local WS/UI + Remote GPU Model API)
 
-Use a separate terminal for each process.
+This is the recommended setup for your laptop:
+- `server/agent_ws_api.py` runs locally.
+- the heavy model API (`multi_model_api.py`) runs on a separate GPU server.
+- local `.env` points `VLM_API_URL` and `AUDIO_API_URL` to that remote GPU endpoint.
 
-Terminal 1:
-```bash
-source .venv/bin/activate
-./server/run_multi_model_api.sh
-```
+Run with 2 terminals:
 
-Terminal 2:
+Terminal 1 (local WS bridge):
 ```bash
 source .venv/bin/activate
 ./server/run_agent_ws_api.sh
 ```
 
-Terminal 3:
+Terminal 2 (frontend):
 ```bash
 cd web
 npm run dev
@@ -69,7 +67,21 @@ npm run dev
 Open:
 `http://localhost:3000`
 
-## Script Behavior Notes
+## Optional Run Mode (Start Multi-Model API on a GPU Host)
+
+Only use this on the machine that should host the heavy models.
+
+Install model-API requirements on that GPU host:
+```bash
+python -m pip install -r server/requirements_multi_model_api.txt
+```
+
+Then run:
+```bash
+./server/run_multi_model_api.sh
+```
+
+## Script Notes
 
 - `./server/run_multi_model_api.sh`:
   - loads `.env` automatically if present,

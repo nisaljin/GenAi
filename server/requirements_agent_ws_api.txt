@@ -1,0 +1,10 @@
+fastapi==0.111.1
+uvicorn==0.30.6
+httpx==0.27.2
+python-dotenv==1.0.1
+requests==2.32.3
+numpy==1.26.4
+opencv-python==4.10.0.84
+pydub==0.25.1
+moviepy==2.2.1
+groq==0.11.0
