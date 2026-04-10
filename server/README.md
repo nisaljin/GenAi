@@ -37,6 +37,22 @@ Model loading:
 
 Additional/alternate inference logic utilities for model calls and testing flows.
 
+## 1.4 Model Matrix
+
+Defaults are defined in `multi_model_api.py`:
+
+| Stage | Purpose | Default Model ID | Endpoint | Override Env |
+|---|---|---|---|---|
+| Perception (VLM) | Read image sequence and produce scene/audio timeline text | `Qwen/Qwen2-VL-2B-Instruct` | `POST /perception` | `PERCEPTION_MODEL` |
+| Planner (LLM) | Produce structured event plan from VLM log | `Qwen/Qwen2.5-7B-Instruct` | `POST /planner` | `PLANNER_MODEL` |
+| Execution (Audio) | Synthesize candidate Foley clips | `facebook/audiogen-medium` | `POST /execution` | `EXECUTION_MODEL` |
+| Verification (CLAP) | Compute text-audio similarity score | `laion/clap-htsat-fused` | `POST /verification` | `VERIFICATION_MODEL` |
+
+Additional model/runtime controls:
+- `OFFLOAD_AFTER_USE`: unload model after each request to reduce memory pressure.
+- `HF_TOKEN` / `HUGGINGFACE_HUB_TOKEN`: access gated/private models.
+- `HF_HOME` / `--cache-dir`: local model cache location.
+
 ## 2. Startup
 
 Run model API first, then WS bridge.

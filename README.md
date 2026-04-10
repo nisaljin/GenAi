@@ -131,6 +131,21 @@ Frontend vars (`web/.env.local`):
 - `NEXT_PUBLIC_AGENT_WS_URL` (default `ws://localhost:8010/ws/foley`)
 - `NEXT_PUBLIC_AGENT_API_URL` (default `http://localhost:8010`)
 
+## 5.1 Model Matrix
+
+Defaults come from `server/multi_model_api.py`:
+
+| Stage | Purpose | Default Model ID | Endpoint | Override Env |
+|---|---|---|---|---|
+| Perception (VLM) | Analyze keyframes and produce scene/audio-relevant log | `Qwen/Qwen2-VL-2B-Instruct` | `POST /perception` | `PERCEPTION_MODEL` |
+| Planner (LLM) | Convert VLM log to timed Foley event plan JSON | `Qwen/Qwen2.5-7B-Instruct` | `POST /planner` | `PLANNER_MODEL` |
+| Execution (Audio) | Generate waveform from text prompt | `facebook/audiogen-medium` | `POST /execution` | `EXECUTION_MODEL` |
+| Verification (CLAP) | Score text-audio similarity for agent loop decisions | `laion/clap-htsat-fused` | `POST /verification` | `VERIFICATION_MODEL` |
+
+Related runtime vars:
+- `VLM_MODEL_NAME` (orchestrator-side metadata/prompt label)
+- `OFFLOAD_AFTER_USE` (model memory behavior on multi-model API)
+
 ## 6. WebSocket Contract
 
 Client sends first message:
