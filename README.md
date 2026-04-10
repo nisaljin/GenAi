@@ -59,3 +59,9 @@ npm run dev
 - Frontend setup:
   - `web/README.md`
 
+## Formal Report Docs
+
+- Documentation index:
+  - `docs/README.md`
+- Detailed LaTeX report:
+  - `docs/report/agentic_multimodal_report.tex`
