@@ -34,32 +34,59 @@ const REASONING_EVENT_TYPES = new Set([
   'video_prepared'
 ])
 
-function TypewriterText({ text, animate = false }) {
+const TYPEWRITER_STEP_MS = 35
+const INTER_EVENT_GAP_MS = 120
+
+function getTypewriterTokens(text) {
+  return String(text || '').split(/(\s+)/).filter(Boolean)
+}
+
+function TypewriterText({ text, animate = false, onComplete }) {
   const [visibleText, setVisibleText] = useState(animate ? '' : text)
+  const completionRef = useRef(onComplete)
+
+  useEffect(() => {
+    completionRef.current = onComplete
+  }, [onComplete])
 
   useEffect(() => {
     if (!animate) {
       setVisibleText(text)
+      if (completionRef.current) completionRef.current()
       return
     }
 
-    const tokens = text.split(/(\s+)/).filter(Boolean)
+    const tokens = getTypewriterTokens(text)
     if (tokens.length === 0) {
       setVisibleText('')
+      if (completionRef.current) completionRef.current()
       return
     }
 
     let index = 0
+    let didComplete = false
     const timer = setInterval(() => {
       index += 1
       setVisibleText(tokens.slice(0, index).join(''))
-      if (index >= tokens.length) clearInterval(timer)
-    }, 35)
+      if (index >= tokens.length) {
+        clearInterval(timer)
+        if (!didComplete && completionRef.current) {
+          didComplete = true
+          completionRef.current()
+        }
+      }
+    }, TYPEWRITER_STEP_MS)
 
     return () => clearInterval(timer)
   }, [text, animate])
 
   return <div className="whitespace-pre-wrap">{visibleText}</div>
+}
+
+function estimateTypewriterMs(text) {
+  const tokenCount = getTypewriterTokens(text).length
+  const ms = tokenCount * TYPEWRITER_STEP_MS + 250
+  return Math.max(600, Math.min(ms, 9000))
 }
 
 function AnnouncementBadge({ text, href = '#' }) {
@@ -130,7 +157,7 @@ function RayBackground() {
   )
 }
 
-function EventFeed({ events, isRunning = false }) {
+function EventFeed({ events, isRunning = false, onAnimatedEventPresented }) {
   const scrollRef = useRef(null)
   const contentRef = useRef(null)
 
@@ -161,39 +188,61 @@ function EventFeed({ events, isRunning = false }) {
 
   return (
     <div ref={scrollRef} className="w-full max-w-[860px] rounded-2xl border border-[#2f3a4b] bg-[#0a1018] p-4 sm:p-5 max-h-[460px] sm:max-h-[520px] overflow-y-auto shadow-[0_12px_40px_rgba(0,0,0,0.45)]">
-      <div className="text-xs uppercase tracking-wide text-[#8a8a8f] mb-3">Live Agent Events</div>
-      <div ref={contentRef} className="space-y-2">
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <div className="text-xs uppercase tracking-wide text-[#8a8a8f]">Live Agent Events</div>
+        <div className="text-[11px] text-[#6f7f95]">Ordered stream, one event at a time</div>
+      </div>
+      <div ref={contentRef} className="space-y-3">
         {events.length === 0 && <p className="text-sm text-[#6a6a6f]">No events yet.</p>}
         {events.map((evt) => (
-          <div key={evt.id} className={`rounded-xl px-3 py-2 text-sm transition-all duration-300 ${evt.role === 'user' ? 'bg-[#19385a] text-blue-100 ml-8 border border-[#2d5278]' : 'bg-[#151a23] text-[#e4e6eb] mr-8 border border-[#293241]'}`}>
-            <div className="text-[11px] text-[#8a8a8f] mb-1">{evt.label}</div>
-            <TypewriterText text={evt.text} animate={Boolean(evt.animateText)} />
-            {evt.media?.url && evt.media?.kind === 'video' && (
-              <video
-                src={evt.media.url}
-                controls
-                className="mt-3 w-full max-h-72 rounded-lg border border-white/10 bg-black object-contain"
+          <div key={evt.id} className="relative pl-6">
+            <span className={`absolute left-0 top-2.5 h-2.5 w-2.5 rounded-full ${evt.role === 'user' ? 'bg-[#42a1ff]' : 'bg-[#7bd88f]'}`} />
+            <span className="absolute left-[5px] top-5 bottom-[-10px] w-px bg-[#293241]" />
+            <div className="rounded-xl border border-[#293241] bg-gradient-to-b from-[#131a25] to-[#101620] px-3 py-2.5 text-sm text-[#d7deea]">
+              <div className="mb-1.5 flex items-center justify-between gap-2">
+                <div className="inline-flex items-center gap-2">
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] uppercase tracking-wide ${evt.role === 'user' ? 'bg-[#16304f] text-[#90cafc]' : 'bg-[#213021] text-[#98e6a5]'}`}>
+                    {evt.role === 'user' ? 'Request' : 'Agent'}
+                  </span>
+                  <span className="text-[11px] text-[#93a4bd]">{evt.label}</span>
+                </div>
+                <span className="text-[10px] text-[#65758b]">#{evt.order}</span>
+              </div>
+              <TypewriterText
+                text={evt.text}
+                animate={Boolean(evt.animateText)}
+                onComplete={evt.animateText ? () => onAnimatedEventPresented(evt.id) : undefined}
               />
-            )}
-            {evt.media?.url && evt.media?.kind === 'audio' && (
-              <audio
-                src={evt.media.url}
-                controls
-                className="mt-3 w-full"
-              />
-            )}
+              {evt.media?.url && evt.media?.kind === 'video' && (
+                <video
+                  src={evt.media.url}
+                  controls
+                  className="mt-3 w-full max-h-72 rounded-lg border border-white/10 bg-black object-contain"
+                />
+              )}
+              {evt.media?.url && evt.media?.kind === 'audio' && (
+                <audio
+                  src={evt.media.url}
+                  controls
+                  className="mt-3 w-full"
+                />
+              )}
+            </div>
           </div>
         ))}
         {isRunning && (
-          <div className="rounded-xl px-3 py-2 text-sm bg-[#151a23] text-[#e4e6eb] mr-8 border border-[#293241]">
-            <div className="text-[11px] text-[#8a8a8f] mb-1">Generating</div>
-            <div className="inline-flex items-center gap-2">
-              <span>Awaiting model response</span>
-              <span className="inline-flex gap-1" aria-hidden="true">
-                <span className="size-1.5 rounded-full bg-[#8ba6c7] animate-bounce [animation-delay:0ms]" />
-                <span className="size-1.5 rounded-full bg-[#8ba6c7] animate-bounce [animation-delay:120ms]" />
-                <span className="size-1.5 rounded-full bg-[#8ba6c7] animate-bounce [animation-delay:240ms]" />
-              </span>
+          <div className="relative pl-6">
+            <span className="absolute left-0 top-2.5 h-2.5 w-2.5 rounded-full bg-[#e6b66a]" />
+            <div className="rounded-xl border border-[#493c26] bg-[#211b12] px-3 py-2 text-sm text-[#f0dfbf]">
+              <div className="text-[11px] text-[#c8ae7c] mb-1">Generating</div>
+              <div className="inline-flex items-center gap-2">
+                <span>Awaiting model response</span>
+                <span className="inline-flex gap-1" aria-hidden="true">
+                  <span className="size-1.5 rounded-full bg-[#f0dfbf] animate-bounce [animation-delay:0ms]" />
+                  <span className="size-1.5 rounded-full bg-[#f0dfbf] animate-bounce [animation-delay:120ms]" />
+                  <span className="size-1.5 rounded-full bg-[#f0dfbf] animate-bounce [animation-delay:240ms]" />
+                </span>
+              </div>
             </div>
           </div>
         )}
@@ -339,10 +388,10 @@ function ChatInput({ onSend, disabled = false }) {
           <div className="flex-1" />
 
           <div className="flex items-center gap-2">
-            <button className="flex items-center gap-1.5 px-3 py-2 rounded-full text-xs font-medium text-[#6a6a6f] hover:text-white hover:bg-white/5 transition-all duration-200">
+            {/* <button className="flex items-center gap-1.5 px-3 py-2 rounded-full text-xs font-medium text-[#6a6a6f] hover:text-white hover:bg-white/5 transition-all duration-200">
               <Lightbulb className="size-4" />
               <span className="hidden sm:inline">Plan</span>
-            </button>
+            </button> */}
 
             <button
               onClick={handleSubmit}
@@ -387,8 +436,8 @@ function mapEventToDisplay(event) {
       eventType: type,
       label: 'Run Started',
       text: p.mode === 'audio_only'
-        ? `Prompt-only mode\nPrompt: ${p.prompt || ''}`
-        : `Video mode\nVideo: ${p.video_path || ''}\nMax retries: ${p.max_retries}\nCLAP threshold: ${p.clap_threshold}`
+        ? `Prompt-only mode enabled.\nI will iteratively generate and score audio for: "${p.prompt || ''}".`
+        : `Video mode enabled.\nI will analyze frames, plan timed cues, then generate and verify each cue.\nMax retries: ${p.max_retries}.\nQuality threshold: ${p.quality_threshold}.`
     }
   }
   if (type === 'vlm_keyframes_extracted') {
@@ -425,7 +474,7 @@ function mapEventToDisplay(event) {
     return {
       eventType: type,
       label: 'Planning',
-      text: `Planned ${p.event_count} event(s).\n${formatPlanEvents(p.events)}`
+      text: `Planning complete. I found ${p.event_count} event(s):\n${formatPlanEvents(p.events)}`
     }
   }
   if (type === 'self_consistency_checked') {
@@ -445,10 +494,11 @@ function mapEventToDisplay(event) {
   }
   if (type === 'attempt_started') return { eventType: type, label: `Attempt ${p.attempt}`, text: `Prompt: ${p.prompt}` }
   if (type === 'verifier_scored') {
+    const status = p.agreement_ok ? 'Verifiers agree.' : 'Verifiers disagree, so this candidate is uncertain.'
     return {
       eventType: type,
       label: 'Verifier Ensemble',
-      text: `Primary: ${p.score_primary}\nSecondary: ${p.score_secondary}\nFinal: ${p.final_score}\nGap: ${p.score_gap} (<= ${p.verifier_gap_delta})\nAgreement: ${String(p.agreement_ok)}`
+      text: `Primary verifier score (raw): ${p.score_primary}\nSecondary verifier score (raw): ${p.score_secondary}\nConservative final score (raw): ${p.raw_final_score}\nDecision quality score (normalized): ${p.quality_score_normalized} (target >= ${p.quality_threshold})\nScore gap: ${p.score_gap} (target <= ${p.verifier_gap_delta})\n${status}`
     }
   }
   if (type === 'cross_modal_checked') {
@@ -457,20 +507,38 @@ function mapEventToDisplay(event) {
     return {
       eventType: type,
       label: 'Cross-Modal Check',
-      text: `Score: ${p.agreement_score} (>= ${p.threshold})\nAgreement: ${String(p.agreement_ok)}\nMatched: ${matched || 'none'}\nMissing: ${missing || 'none'}`
+      text: `Prompt-to-scene agreement score: ${p.agreement_score} (target >= ${p.threshold})\nAgreement passed: ${String(p.agreement_ok)}\nMatched scene cues: ${matched || 'none'}\nStill missing: ${missing || 'none'}`
     }
   }
   if (type === 'uncertainty_flagged') {
     const reasons = Array.isArray(p.reasons) ? p.reasons.join(', ') : 'unknown'
+    const blocked = p.acceptance_blocked_by_uncertainty ? 'Yes' : 'No'
     return {
       eventType: type,
       label: 'Uncertainty',
-      text: `Reasons: ${reasons}\nVerifier gap: ${p.score_gap}\nCross-modal score: ${p.cross_modal_score}`
+      text: `I marked this attempt as uncertain.\nReason(s): ${reasons}\nVerifier gap: ${p.score_gap}\nCross-modal score: ${p.cross_modal_score}\nNormalized quality score: ${p.quality_score_normalized} (target >= ${p.quality_threshold})\nAcceptance blocked by uncertainty checks: ${blocked}`
     }
   }
   if (type === 'clap_scored') return { eventType: type, label: 'CLAP Score', text: `Score ${p.score} (threshold ${p.threshold})` }
-  if (type === 'decision_made') return { eventType: type, label: `Decision: ${p.action}`, text: `${p.reasoning}\n(confidence ${p.confidence})` }
-  if (type === 'event_completed') return { eventType: type, label: 'Event Completed', text: `Final score ${p.final_score}` }
+  if (type === 'decision_made') {
+    let summary = ''
+    if (p.action === 'ACCEPT') summary = 'This candidate is accepted and locked for this event.'
+    if (p.action === 'RETRY_REWRITE') summary = 'I will rewrite the prompt and try again for a better-aligned sound.'
+    if (p.action === 'RETRY_BEST') summary = 'I will retry using the best prompt seen so far.'
+    if (p.action === 'STOP_BEST') summary = 'I am stopping retries and selecting the strongest candidate seen so far.'
+    return {
+      eventType: type,
+      label: `Decision: ${p.action}`,
+      text: `${summary}\nNormalized quality score: ${p.normalized_score} (target >= ${p.quality_threshold})\nConfidence: ${p.confidence}\nAcceptance blocked by uncertainty checks: ${p.acceptance_blocked_by_uncertainty ? 'Yes' : 'No'}\nController note: ${p.reasoning}`
+    }
+  }
+  if (type === 'event_completed') {
+    return {
+      eventType: type,
+      label: 'Event Completed',
+      text: `Final normalized score ${p.final_score} (target >= ${p.quality_threshold})`
+    }
+  }
   if (type === 'run_completed') {
     const output = p.output_video_path || p.output_audio_path || ''
     const mediaKind = p.output_video_path ? 'video' : (p.output_audio_path ? 'audio' : '')
@@ -505,8 +573,20 @@ export function BoltStyleChat({
   const eventQueueRef = useRef([])
   const queueTimerRef = useRef(null)
   const queueBusyRef = useRef(false)
+  const currentlyAnimatingEventIdRef = useRef('')
+  const eventOrderRef = useRef(0)
+
+  const scheduleQueueAdvance = (delayMs = INTER_EVENT_GAP_MS) => {
+    if (queueTimerRef.current) clearTimeout(queueTimerRef.current)
+    queueTimerRef.current = setTimeout(() => {
+      queueBusyRef.current = false
+      flushNextEvent()
+    }, delayMs)
+  }
 
   const flushNextEvent = () => {
+    if (queueBusyRef.current) return
+
     if (eventQueueRef.current.length === 0) {
       queueBusyRef.current = false
       return
@@ -515,11 +595,32 @@ export function BoltStyleChat({
     queueBusyRef.current = true
     const next = eventQueueRef.current.shift()
     setEvents((prev) => [...prev, next])
-    queueTimerRef.current = setTimeout(flushNextEvent, next.animateText ? 240 : 120)
+    if (next.animateText) {
+      currentlyAnimatingEventIdRef.current = next.id
+      queueTimerRef.current = setTimeout(() => {
+        if (currentlyAnimatingEventIdRef.current !== next.id) return
+        currentlyAnimatingEventIdRef.current = ''
+        queueBusyRef.current = false
+        flushNextEvent()
+      }, estimateTypewriterMs(next.text) + 300)
+      return
+    }
+    scheduleQueueAdvance(typeof next.delayMs === 'number' ? next.delayMs : INTER_EVENT_GAP_MS)
+  }
+
+  const onAnimatedEventPresented = (eventId) => {
+    if (currentlyAnimatingEventIdRef.current !== eventId) return
+    currentlyAnimatingEventIdRef.current = ''
+    scheduleQueueAdvance(INTER_EVENT_GAP_MS)
   }
 
   const enqueueEvent = (eventObj) => {
-    eventQueueRef.current.push(eventObj)
+    const normalized = {
+      ...eventObj,
+      id: eventObj.id || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      order: eventObj.order || (eventOrderRef.current += 1)
+    }
+    eventQueueRef.current.push(normalized)
     if (!queueBusyRef.current) flushNextEvent()
   }
 
@@ -532,13 +633,13 @@ export function BoltStyleChat({
 
   const pushEvent = (role, label, text, link = '', animateText = false) => {
     enqueueEvent({
-      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       role,
       label,
       text,
       link,
       media: null,
-      animateText
+      animateText,
+      delayMs: animateText ? estimateTypewriterMs(text) : 140
     })
   }
 
@@ -552,6 +653,8 @@ export function BoltStyleChat({
     setEvents([])
     eventQueueRef.current = []
     queueBusyRef.current = false
+    currentlyAnimatingEventIdRef.current = ''
+    eventOrderRef.current = 0
     if (queueTimerRef.current) clearTimeout(queueTimerRef.current)
     pushEvent('user', 'Generation Request', `Prompt: ${prompt}\nVideo: ${videoFile ? videoFile.name : 'none (prompt-only)'}`)
 
@@ -602,13 +705,15 @@ export function BoltStyleChat({
         const event = JSON.parse(messageEvent.data)
         const display = mapEventToDisplay(event)
         enqueueEvent({
-          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
           role: 'assistant',
           label: display.label,
           text: display.text,
           link: display.link || '',
           media: display.media || null,
-          animateText: REASONING_EVENT_TYPES.has(display.eventType)
+          animateText: REASONING_EVENT_TYPES.has(display.eventType),
+          delayMs: REASONING_EVENT_TYPES.has(display.eventType)
+            ? estimateTypewriterMs(display.text)
+            : INTER_EVENT_GAP_MS
         })
 
         if (event.type === 'run_completed' || event.type === 'run_failed') {
@@ -658,9 +763,13 @@ export function BoltStyleChat({
         )}
 
         {hasSubmitted && (
-          <div className="w-full max-w-[860px] mb-6 sm:mb-8">
-            <EventFeed events={events} isRunning={isRunning} />
-          </div>
+        <div className="w-full max-w-[860px] mb-6 sm:mb-8">
+            <EventFeed
+              events={events}
+              isRunning={isRunning}
+              onAnimatedEventPresented={onAnimatedEventPresented}
+            />
+        </div>
         )}
 
         {hasSubmitted && !isRunning && (
@@ -680,6 +789,8 @@ export function BoltStyleChat({
                 setCanRetry(false)
                 eventQueueRef.current = []
                 queueBusyRef.current = false
+                currentlyAnimatingEventIdRef.current = ''
+                eventOrderRef.current = 0
                 if (queueTimerRef.current) clearTimeout(queueTimerRef.current)
               }}
               className="px-4 py-2 rounded-full text-sm text-white bg-white/10 hover:bg-white/20 transition-colors"
