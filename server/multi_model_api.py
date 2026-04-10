@@ -39,6 +39,7 @@ DEFAULT_VLM = "Qwen/Qwen2-VL-2B-Instruct"
 DEFAULT_PLANNER = "Qwen/Qwen2.5-7B-Instruct"
 DEFAULT_EXECUTION = "facebook/audiogen-medium"
 DEFAULT_VERIFIER = "laion/clap-htsat-fused"
+DEFAULT_VERIFIER_SECONDARY = "laion/larger_clap_general"
 
 WAV_SAMPLE_RATE = 16000
 CLAP_SAMPLE_RATE = 48000
@@ -82,6 +83,8 @@ class RuntimeConfig:
     planner_model: str
     execution_model: str
     verification_model: str
+    verification_model_secondary: str | None
+    verifier_gap_delta: float
     device: str
     dtype: torch.dtype
     offload_after_use: bool
@@ -96,6 +99,8 @@ class ModelRegistry:
         self._execution_model = None
         self._verification_model = None
         self._verification_processor = None
+        self._verification_model_secondary = None
+        self._verification_processor_secondary = None
 
     def _torch_dtype(self) -> torch.dtype:
         return self.config.dtype if self.config.device == "cuda" else torch.float32
@@ -188,6 +193,36 @@ class ModelRegistry:
         _log(f"[load][verification] done elapsed_sec={time.time() - t0:.2f}")
         return processor, model
 
+    def load_verification_secondary(self) -> tuple[ClapProcessor, ClapModel]:
+        secondary_name = (self.config.verification_model_secondary or "").strip()
+        if not secondary_name:
+            return self.load_verification()
+
+        if secondary_name == self.config.verification_model:
+            return self.load_verification()
+
+        if self._verification_processor_secondary is not None and self._verification_model_secondary is not None:
+            _log("[load][verification_secondary] using cached processor+model")
+            return self._verification_processor_secondary, self._verification_model_secondary
+
+        _log(f"[load][verification_secondary] start model={secondary_name}")
+        t0 = time.time()
+        processor = ClapProcessor.from_pretrained(
+            secondary_name,
+            cache_dir=self.config.cache_dir,
+            token=self.config.hf_token,
+        )
+        model = ClapModel.from_pretrained(
+            secondary_name,
+            cache_dir=self.config.cache_dir,
+            token=self.config.hf_token,
+        ).to(self.config.device)
+
+        self._verification_processor_secondary = processor
+        self._verification_model_secondary = model
+        _log(f"[load][verification_secondary] done elapsed_sec={time.time() - t0:.2f}")
+        return processor, model
+
     def _clear_cuda_cache(self) -> None:
         if self.config.device == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -211,6 +246,8 @@ class ModelRegistry:
     def unload_verification(self) -> None:
         self._verification_processor = None
         self._verification_model = None
+        self._verification_processor_secondary = None
+        self._verification_model_secondary = None
         gc.collect()
         self._clear_cuda_cache()
 
@@ -221,6 +258,7 @@ class ModelRegistry:
             ("planner", self.load_planner),
             ("execution", self.load_execution),
             ("verification", self.load_verification),
+            ("verification_secondary", self.load_verification_secondary),
         ):
             _log(f"[warmup][{name}] start")
             t0 = time.time()
@@ -245,6 +283,39 @@ def decode_b64_audio(audio_b64: str) -> np.ndarray:
     return audio_array
 
 
+def clap_similarity(
+    processor: ClapProcessor,
+    model: ClapModel,
+    prompt: str,
+    audio: np.ndarray,
+    sample_rate: int,
+    device: str,
+) -> float:
+    try:
+        inputs = processor(
+            text=[prompt],
+            audio=audio,
+            return_tensors="pt",
+            padding=True,
+            sampling_rate=sample_rate,
+        )
+    except (TypeError, ValueError):
+        inputs = processor(
+            text=[prompt],
+            audios=audio,
+            return_tensors="pt",
+            padding=True,
+            sampling_rate=sample_rate,
+        )
+    inputs = {
+        k: (v.to(device) if hasattr(v, "to") else v)
+        for k, v in inputs.items()
+    }
+    with torch.no_grad():
+        outputs = model(**inputs)
+        return float(outputs.logits_per_audio[0][0].item())
+
+
 def build_app(registry: ModelRegistry) -> FastAPI:
     app = FastAPI(title="Multi-Model Foley API")
 
@@ -258,7 +329,9 @@ def build_app(registry: ModelRegistry) -> FastAPI:
                 "planner": registry.config.planner_model,
                 "execution": registry.config.execution_model,
                 "verification": registry.config.verification_model,
+                "verification_secondary": registry.config.verification_model_secondary or registry.config.verification_model,
             },
+            "verifier_gap_delta": registry.config.verifier_gap_delta,
         }
 
     @app.post("/warmup")
@@ -401,25 +474,38 @@ def build_app(registry: ModelRegistry) -> FastAPI:
     def verification(req: VerificationRequest) -> dict[str, Any]:
         try:
             processor, model = registry.load_verification()
+            processor_secondary, model_secondary = registry.load_verification_secondary()
             audio = decode_b64_audio(req.audio_base64)
 
-            inputs = processor(
-                text=[req.prompt],
-                audios=audio,
-                return_tensors="pt",
-                padding=True,
-                sampling_rate=CLAP_SAMPLE_RATE,
+            score_primary = clap_similarity(
+                processor=processor,
+                model=model,
+                prompt=req.prompt,
+                audio=audio,
+                sample_rate=CLAP_SAMPLE_RATE,
+                device=registry.config.device,
             )
-            inputs = {
-                k: (v.to(registry.config.device) if hasattr(v, "to") else v)
-                for k, v in inputs.items()
+            score_secondary = clap_similarity(
+                processor=processor_secondary,
+                model=model_secondary,
+                prompt=req.prompt,
+                audio=audio,
+                sample_rate=CLAP_SAMPLE_RATE,
+                device=registry.config.device,
+            )
+            score_gap = abs(score_primary - score_secondary)
+            agreement_ok = score_gap <= registry.config.verifier_gap_delta
+            final_score = min(score_primary, score_secondary)
+
+            return {
+                "similarity_score": final_score,
+                "score_primary": score_primary,
+                "score_secondary": score_secondary,
+                "score_gap": score_gap,
+                "agreement_ok": agreement_ok,
+                "final_score": final_score,
+                "verifier_gap_delta": registry.config.verifier_gap_delta,
             }
-
-            with torch.no_grad():
-                outputs = model(**inputs)
-                score = float(outputs.logits_per_audio[0][0].item())
-
-            return {"similarity_score": score}
         except Exception as exc:
             _log(f"[error][verification] {exc}\n{traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -445,6 +531,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--planner-model", default=os.getenv("PLANNER_MODEL", DEFAULT_PLANNER))
     parser.add_argument("--execution-model", default=os.getenv("EXECUTION_MODEL", DEFAULT_EXECUTION))
     parser.add_argument("--verification-model", default=os.getenv("VERIFICATION_MODEL", DEFAULT_VERIFIER))
+    parser.add_argument(
+        "--verification-model-secondary",
+        default=os.getenv("VERIFICATION_MODEL_SECONDARY", DEFAULT_VERIFIER_SECONDARY),
+    )
+    parser.add_argument(
+        "--verifier-gap-delta",
+        type=float,
+        default=float(os.getenv("VERIFIER_GAP_DELTA", "0.25")),
+    )
     parser.add_argument(
         "--offload-after-use",
         action="store_true",
@@ -482,6 +577,8 @@ def main() -> None:
         planner_model=args.planner_model,
         execution_model=args.execution_model,
         verification_model=args.verification_model,
+        verification_model_secondary=args.verification_model_secondary,
+        verifier_gap_delta=max(0.0, float(args.verifier_gap_delta)),
         device=device,
         dtype=dtype,
         offload_after_use=args.offload_after_use,
@@ -494,6 +591,8 @@ def main() -> None:
     _log(f"[startup] planner_model={config.planner_model}")
     _log(f"[startup] execution_model={config.execution_model}")
     _log(f"[startup] verification_model={config.verification_model}")
+    _log(f"[startup] verification_model_secondary={config.verification_model_secondary}")
+    _log(f"[startup] verifier_gap_delta={config.verifier_gap_delta}")
     _log(f"[startup] offload_after_use={config.offload_after_use}")
     _log(f"[startup] uvicorn_log_level={args.uvicorn_log_level}")
 

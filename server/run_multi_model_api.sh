@@ -24,6 +24,8 @@ PERCEPTION_MODEL="${PERCEPTION_MODEL:-Qwen/Qwen2-VL-2B-Instruct}"
 PLANNER_MODEL="${PLANNER_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 EXECUTION_MODEL="${EXECUTION_MODEL:-facebook/audiogen-medium}"
 VERIFICATION_MODEL="${VERIFICATION_MODEL:-laion/clap-htsat-fused}"
+VERIFICATION_MODEL_SECONDARY="${VERIFICATION_MODEL_SECONDARY:-laion/larger_clap_general}"
+VERIFIER_GAP_DELTA="${VERIFIER_GAP_DELTA:-0.25}"
 
 mkdir -p "${CACHE_DIR}"
 
@@ -35,6 +37,8 @@ echo "[runner] perception_model=${PERCEPTION_MODEL}"
 echo "[runner] planner_model=${PLANNER_MODEL}"
 echo "[runner] execution_model=${EXECUTION_MODEL}"
 echo "[runner] verification_model=${VERIFICATION_MODEL}"
+echo "[runner] verification_model_secondary=${VERIFICATION_MODEL_SECONDARY}"
+echo "[runner] verifier_gap_delta=${VERIFIER_GAP_DELTA}"
 echo "[runner] warmup_on_start=${WARMUP_ON_START}"
 echo "[runner] cache_size_before=$(du -sh "${CACHE_DIR}" 2>/dev/null | awk '{print $1}')"
 
@@ -73,6 +77,8 @@ CMD=(
   --planner-model "${PLANNER_MODEL}"
   --execution-model "${EXECUTION_MODEL}"
   --verification-model "${VERIFICATION_MODEL}"
+  --verification-model-secondary "${VERIFICATION_MODEL_SECONDARY}"
+  --verifier-gap-delta "${VERIFIER_GAP_DELTA}"
 )
 
 if [[ "${WARMUP_ON_START}" == "1" ]]; then

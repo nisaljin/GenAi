@@ -1,222 +1,117 @@
 # GenAI Music In Video (Agentic Foley)
 
-End-to-end system for generating Foley audio from video with an agentic retry loop.
+Agentic pipeline that generates Foley audio from video (or prompt-only), scores quality with CLAP, and iteratively retries/refines until acceptance criteria are met.
 
-The pipeline can run in two modes:
-- `video` mode: analyze visual frames, plan timed sound events, iteratively synthesize/score, then mux into output video.
-- `audio_only` mode: run the same inner loop from prompt text and output an audio file.
+## Prerequisites
 
-## 1. Architecture
+- Python `3.10+` (tested with Python `3.12`)
+- Node.js `18+` and npm
+- `ffmpeg` available on `PATH` (required for robust video/audio muxing)
 
-### 1.1 Components
+## Repo Structure
 
-- `web/` (Next.js UI)
-  - Uploads video
-  - Opens WebSocket to stream run events live
-  - Renders agent reasoning timeline and inline output players
+- `main.py`: core orchestration and agentic loop.
+- `server/`: backend APIs (`agent_ws_api.py`, `multi_model_api.py`).
+- `web/`: Next.js frontend for upload + live event streaming.
+- `notebooks/`: teammate-facing deep-dive + stage test notebook.
+- `scripts/`: stage tests and helper scripts.
 
-- `server/agent_ws_api.py` (WebSocket bridge)
-  - `PUT /upload-video`
-  - `GET /artifacts/{kind}/{filename}`
-  - `WS /ws/foley`
-  - Runs orchestration in worker thread and forwards events to UI
+## Environment Setup
 
-- `main.py` (`FoleyOrchestrator`)
-  - Controls the agentic loop
-  - Runs perception/planning/execution/verification steps
-  - Stitches final media and writes run trace JSON
-
-- `server/multi_model_api.py` (model serving)
-  - `/perception`: VLM analysis from keyframes
-  - `/planner`: event planning JSON generation
-  - `/execution`: audio synthesis
-  - `/verification`: CLAP similarity scoring
-
-### 1.2 Runtime Sequence
-
-1. UI uploads video (`PUT /upload-video`)
-2. UI opens WebSocket (`/ws/foley`) and sends start payload
-3. WS bridge starts orchestrator pipeline
-4. Orchestrator emits events during each stage
-5. WS bridge returns events in real time to UI
-6. Final artifact URL is attached to `run_completed`
-7. UI renders inline `<audio>` or `<video>` player
-
-## 2. Repository Layout
-
-- `main.py` - orchestration and event emission
-- `server/` - backend services and run scripts
-- `web/` - frontend app
-- `notebooks/` - system docs and experimentation notebooks
-- `scripts/` - stage tests and utilities
-- `generated_outputs/` - runtime outputs (audio/video/uploads/agent_logs)
-
-## 3. Local Setup
-
-### 3.1 Prerequisites
-
-- Python 3.12+
-- Node.js 18+
-- ffmpeg (recommended for robust muxing)
-- GPU optional but strongly recommended for model-serving performance
-
-### 3.2 Python Environment
-
+1. Create and activate a Python virtual environment at repo root:
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -r server/requirements.txt
-pip install -r server/requirements_multi_model_api.txt
+python -m pip install --upgrade pip
 ```
 
-### 3.3 Frontend
+2. Install backend requirements once:
+```bash
+python -m pip install -r server/requirements_multi_model_api.txt
+python -m pip install -r server/requirements.txt
+```
 
+3. Install frontend dependencies:
 ```bash
 cd web
 npm install
+cd ..
 ```
 
-## 4. Run the System
-
-Open 3 terminals.
-
-### Terminal A: Multi-model API
-
+4. Create your runtime env file:
 ```bash
+cp .env.example .env
+```
+Then edit `.env` with your own keys and endpoint values.
+
+## Run (3 terminals)
+
+Use a separate terminal for each process.
+
+Terminal 1:
+```bash
+source .venv/bin/activate
 ./server/run_multi_model_api.sh
 ```
 
-Expected health:
-
+Terminal 2:
 ```bash
-curl http://localhost:8000/health
-```
-
-### Terminal B: WebSocket bridge
-
-```bash
+source .venv/bin/activate
 ./server/run_agent_ws_api.sh
 ```
 
-Expected health:
-
-```bash
-curl http://localhost:8010/health
-```
-
-### Terminal C: Frontend
-
+Terminal 3:
 ```bash
 cd web
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+Open:
+`http://localhost:3000`
 
-## 5. Environment Variables
+## Script Behavior Notes
 
-Core vars (typically in `.env`):
-
-- `VLM_API_URL` - base URL for perception endpoint target
-- `AUDIO_API_URL` - base URL for execution/verification targets
-- `VLM_MODEL_NAME` - VLM identity used by orchestrator prompt metadata
-- `MAX_PERCEPTION_FRAMES` - upper bound for sampled keyframes
-- `PERCEPTION_RESIZE_TO` - square resize dimension for frame encoding
-- `PERCEPTION_CENTER_CROP` - whether to center-crop frames
-- `MAX_VIDEO_SECONDS` - max analyzed/muxed duration before trim
-- `PROMPT_ONLY_DURATION_SEC` - default audio-only duration
-
-Frontend vars (`web/.env.local`):
-
-- `NEXT_PUBLIC_AGENT_WS_URL` (default `ws://localhost:8010/ws/foley`)
-- `NEXT_PUBLIC_AGENT_API_URL` (default `http://localhost:8010`)
-
-## 5.1 Model Matrix
-
-Defaults come from `server/multi_model_api.py`:
-
-| Stage | Purpose | Default Model ID | Endpoint | Override Env |
-|---|---|---|---|---|
-| Perception (VLM) | Analyze keyframes and produce scene/audio-relevant log | `Qwen/Qwen2-VL-2B-Instruct` | `POST /perception` | `PERCEPTION_MODEL` |
-| Planner (LLM) | Convert VLM log to timed Foley event plan JSON | `Qwen/Qwen2.5-7B-Instruct` | `POST /planner` | `PLANNER_MODEL` |
-| Execution (Audio) | Generate waveform from text prompt | `facebook/audiogen-medium` | `POST /execution` | `EXECUTION_MODEL` |
-| Verification (CLAP) | Score text-audio similarity for agent loop decisions | `laion/clap-htsat-fused` | `POST /verification` | `VERIFICATION_MODEL` |
-
-Related runtime vars:
-- `VLM_MODEL_NAME` (orchestrator-side metadata/prompt label)
-- `OFFLOAD_AFTER_USE` (model memory behavior on multi-model API)
-
-## 6. WebSocket Contract
-
-Client sends first message:
-
-```json
-{
-  "action": "start",
-  "prompt": "optional",
-  "video_path": "/absolute/backend/path/or-empty"
-}
+- `./server/run_multi_model_api.sh`:
+  - loads `.env` automatically if present,
+  - installs apt deps on Linux if `apt` exists (`INSTALL_APT_DEPS=1` by default),
+  - installs pip deps from `server/requirements_multi_model_api.txt` by default (`INSTALL_PIP_DEPS=1`).
+- If you already installed dependencies manually, run:
+```bash
+INSTALL_APT_DEPS=0 INSTALL_PIP_DEPS=0 ./server/run_multi_model_api.sh
 ```
+- `./server/run_agent_ws_api.sh` automatically activates `.venv` if available.
 
-Server emits event envelope:
+## Key Endpoints
 
-```json
-{
-  "type": "event_name",
-  "payload": { "...": "..." }
-}
-```
+- Model API health: `http://localhost:8000/health`
+- WS bridge health: `http://localhost:8010/health`
+- WebSocket stream: `ws://localhost:8010/ws/foley`
 
-Common event types:
+## Core Flow
 
-- lifecycle: `run_started`, `video_prepared`, `planning_completed`, `run_completed`, `run_failed`
-- perception: `vlm_keyframes_extracted`, `vlm_keyframes_downsampled`, `vlm_request_started`, `vlm_response_received`, `vlm_request_failed`, `perception_completed`
-- loop: `attempt_started`, `clap_scored`, `decision_made`, `event_completed`
+1. Upload video (`PUT /upload-video`) or run prompt-only.
+2. Start run over WebSocket (`/ws/foley`).
+3. Orchestrator emits live events:
+   - perception/VLM
+   - planning
+   - attempt loop (generate -> score -> decide)
+4. Final artifact served from `/artifacts/{audio|video}/...`.
+5. Frontend renders inline `<audio>`/`<video>`.
 
-## 7. Agentic Loop Summary
+## Team Docs
 
-For each planned event:
+- Architecture deep dive notebook:
+  - `notebooks/agentic_foley_system_deep_dive.ipynb`
+- Notebook index:
+  - `notebooks/README.md`
+- Backend details:
+  - `server/README.md`
+- Frontend setup:
+  - `web/README.md`
 
-1. Generate audio candidate
-2. Score with CLAP
-3. Decide action (`ACCEPT`, `RETRY_REWRITE`, `RETRY_BEST`, `STOP_BEST`)
-4. Retry until accepted or retries exhausted
-5. Select best candidate and continue
+## Formal Report Docs
 
-After all events, final timeline audio is mixed and muxed into output media.
-
-## 8. Outputs
-
-Generated under `generated_outputs/`:
-
-- `uploads/` - uploaded source files
-- `audio/` - generated wav files
-- `video/` - final muxed videos
-- `agent_logs/` - run trace JSON (`*_agent_trace.json`)
-
-## 9. Troubleshooting
-
-### Upload fails with `TypeError: Failed to fetch`
-
-Usually CORS preflight failure (`OPTIONS ... 405`). Ensure CORS middleware is active in `agent_ws_api.py`.
-
-### WebSocket not connecting
-
-- Verify bridge is running on `:8010`
-- Verify WS URL is `ws://.../ws/foley`
-- Install websocket support: `uvicorn[standard]`, `websockets`, or `wsproto`
-
-### Timeline too generic
-
-Common causes:
-- prompt override path bypasses VLM timeline
-- small VLM model output behavior
-- too few keyframes or low token budget in perception
-
-## 10. Team Docs
-
-- System deep dive notebook: `notebooks/agentic_foley_system_deep_dive.ipynb`
-- Notebook index: `notebooks/README.md`
-- Backend details: `server/README.md`
-- Frontend details: `web/README.md`
-- Stage test notes: `scripts/README_STAGE_TESTS.md`
+- Documentation index:
+  - `docs/README.md`
+- Detailed LaTeX report:
+  - `docs/report/agentic_multimodal_report.tex`

@@ -6,11 +6,12 @@ import shutil
 import subprocess
 import traceback
 import time
+import re
 import numpy as np
 import requests
 from pydub import AudioSegment
 from moviepy import VideoFileClip, AudioFileClip
-from typing import List, Dict, Any, Callable, Optional
+from typing import List, Dict, Any, Callable, Optional, Set
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from groq import Groq
@@ -51,7 +52,12 @@ class AttemptRecord:
     attempt: int
     prompt: str
     score: float
+    raw_final_score: float
     audio_file_path: str
+    verifier: Dict[str, Any] = None
+    cross_modal: Dict[str, Any] = None
+    uncertainty_reasons: List[str] = None
+    acceptance_blocked_by_uncertainty: bool = False
 
 
 @dataclass
@@ -464,7 +470,7 @@ class VerificationNode:
         base_url = os.getenv("AUDIO_API_URL").rstrip('/')
         self.api_url, self.api_url_fallback = build_endpoint(base_url, "/verification", "/evaluate")
 
-    def evaluate(self, prompt: str, audio_path: str) -> float:
+    def evaluate(self, prompt: str, audio_path: str) -> Dict[str, Any]:
         with open(audio_path, "rb") as fh:
             b64_audio = base64.b64encode(fh.read()).decode('utf-8')
             
@@ -474,9 +480,26 @@ class VerificationNode:
         if not response.ok:
             raise RuntimeError(f"Verification API error {response.status_code}: {response.text}")
         
-        score = response.json().get("similarity_score", 0.0)
-        print(f"[Verification Node] CLAP Score: {score:.2f} for '{prompt[:40]}...'")
-        return score
+        body = response.json()
+        score_primary = float(body.get("score_primary", body.get("similarity_score", 0.0)))
+        score_secondary = float(body.get("score_secondary", score_primary))
+        final_score = float(body.get("final_score", body.get("similarity_score", score_primary)))
+        score_gap = float(body.get("score_gap", abs(score_primary - score_secondary)))
+        agreement_ok = bool(body.get("agreement_ok", True))
+        verifier_gap_delta = float(body.get("verifier_gap_delta", 0.25))
+        print(
+            "[Verification Node] "
+            f"primary={score_primary:.2f} secondary={score_secondary:.2f} "
+            f"final={final_score:.2f} gap={score_gap:.2f} agreement_ok={agreement_ok}"
+        )
+        return {
+            "score_primary": score_primary,
+            "score_secondary": score_secondary,
+            "final_score": final_score,
+            "score_gap": score_gap,
+            "agreement_ok": agreement_ok,
+            "verifier_gap_delta": verifier_gap_delta,
+        }
 
 # ==========================================
 # Final Stage: Stitching & Orchestration
@@ -489,6 +512,11 @@ class FoleyOrchestrator:
         self.execution = ExecutionNode()
         self.verification = VerificationNode(threshold=0.50)
         self.max_retries = 3
+        self.clap_score_min = float(os.getenv("CLAP_SCORE_MIN", "0.0"))
+        self.clap_score_max = float(os.getenv("CLAP_SCORE_MAX", "10.0"))
+        self.quality_threshold = float(os.getenv("QUALITY_THRESHOLD", "0.60"))
+        self.self_consistency_runs = max(1, int(os.getenv("SELF_CONSISTENCY_RUNS", "3")))
+        self.cross_modal_threshold = float(os.getenv("CROSS_MODAL_AGREEMENT_THRESHOLD", "0.35"))
         self.max_video_seconds = float(os.getenv("MAX_VIDEO_SECONDS", "15"))
         self.video_output_dir = os.getenv("GENERATED_VIDEO_DIR", "./generated_outputs/video")
         self.temp_output_dir = os.getenv("GENERATED_TEMP_DIR", "./generated_outputs/tmp")
@@ -506,7 +534,123 @@ class FoleyOrchestrator:
         except Exception as e:
             print(f"[Orchestrator] Event callback error: {e}")
 
-    def run_event_agent(self, event: AudioEvent) -> AudioEvent:
+    @staticmethod
+    def _prompt_tokens(text: str) -> Set[str]:
+        stop = {
+            "the", "a", "an", "and", "or", "for", "with", "from", "into", "onto", "near",
+            "continuous", "ambient", "background", "scene", "appropriate", "sound", "audio",
+            "detailed", "highly", "quality", "matching", "visible",
+        }
+        tokens = {
+            tok for tok in re.findall(r"[a-zA-Z]+", text.lower())
+            if len(tok) > 2 and tok not in stop
+        }
+        return tokens
+
+    @staticmethod
+    def _clip01(value: float) -> float:
+        return min(max(value, 0.0), 1.0)
+
+    def normalize_quality_score(self, raw_final_score: float) -> float:
+        denom = self.clap_score_max - self.clap_score_min
+        if denom <= 0:
+            return 0.0
+        normalized = (raw_final_score - self.clap_score_min) / denom
+        return self._clip01(normalized)
+
+    def extract_expected_audio_keywords(self, vlm_log: str) -> Set[str]:
+        candidate_words = {
+            "footstep", "footsteps", "gravel", "wind", "water", "splash", "rain", "thunder",
+            "bird", "birds", "chirp", "rustle", "leaves", "door", "metal", "wood", "glass",
+            "engine", "car", "vehicle", "crowd", "applause", "fire", "crackle", "wave", "ocean",
+            "river", "bike", "chain", "bell", "dog", "bark", "cat", "meow", "click", "swish",
+        }
+        tokens = self._prompt_tokens(vlm_log)
+        matched = {t for t in tokens if t in candidate_words}
+        if not matched:
+            matched = set(list(tokens)[:6])
+        return matched
+
+    def compute_cross_modal_agreement(self, prompt: str, expected_keywords: Set[str]) -> Dict[str, Any]:
+        if not expected_keywords:
+            return {
+                "agreement_score": 1.0,
+                "matched_keywords": [],
+                "missing_keywords": [],
+                "agreement_ok": True,
+            }
+        prompt_tokens = self._prompt_tokens(prompt)
+        matched = sorted([w for w in expected_keywords if w in prompt_tokens])
+        missing = sorted([w for w in expected_keywords if w not in prompt_tokens])
+        agreement_score = len(matched) / max(len(expected_keywords), 1)
+        agreement_ok = agreement_score >= self.cross_modal_threshold
+        return {
+            "agreement_score": agreement_score,
+            "matched_keywords": matched,
+            "missing_keywords": missing,
+            "agreement_ok": agreement_ok,
+        }
+
+    def evaluate_planner_self_consistency(self, vlm_log: str, video_duration_sec: float) -> Dict[str, Any]:
+        plans: List[List[AudioEvent]] = []
+        for _ in range(self.self_consistency_runs):
+            plans.append(self.planner.create_audio_plan(vlm_log, video_duration_sec))
+
+        non_empty = [p for p in plans if p]
+        if not non_empty:
+            return {
+                "stable": False,
+                "num_runs": self.self_consistency_runs,
+                "count_variance": 0.0,
+                "avg_timestamp_diff": 0.0,
+                "avg_prompt_jaccard": 0.0,
+                "selected_plan": [],
+            }
+
+        counts = [len(p) for p in non_empty]
+        count_variance = float(np.var(counts)) if len(counts) > 1 else 0.0
+
+        base = sorted(non_empty[0], key=lambda e: e.timestamp_sec)
+        ts_diffs: List[float] = []
+        jaccards: List[float] = []
+        for other in non_empty[1:]:
+            other_sorted = sorted(other, key=lambda e: e.timestamp_sec)
+            m = min(len(base), len(other_sorted))
+            if m == 0:
+                continue
+            for i in range(m):
+                ts_diffs.append(abs(base[i].timestamp_sec - other_sorted[i].timestamp_sec))
+                a = self._prompt_tokens(base[i].original_prompt)
+                b = self._prompt_tokens(other_sorted[i].original_prompt)
+                union = a | b
+                inter = a & b
+                jaccards.append((len(inter) / len(union)) if union else 1.0)
+
+        avg_timestamp_diff = float(np.mean(ts_diffs)) if ts_diffs else 0.0
+        avg_prompt_jaccard = float(np.mean(jaccards)) if jaccards else 1.0
+
+        stable = (
+            count_variance <= 1.0
+            and avg_timestamp_diff <= 1.5
+            and avg_prompt_jaccard >= 0.2
+        )
+
+        median_count = int(np.median(counts))
+        selected = min(
+            non_empty,
+            key=lambda p: (abs(len(p) - median_count), len(p)),
+        )
+
+        return {
+            "stable": stable,
+            "num_runs": self.self_consistency_runs,
+            "count_variance": count_variance,
+            "avg_timestamp_diff": avg_timestamp_diff,
+            "avg_prompt_jaccard": avg_prompt_jaccard,
+            "selected_plan": selected,
+        }
+
+    def run_event_agent(self, event: AudioEvent, expected_keywords: Optional[Set[str]] = None) -> AudioEvent:
         state = EventAgentState(timestamp_sec=event.timestamp_sec, duration_sec=event.duration_sec)
         current_prompt = event.original_prompt
 
@@ -529,37 +673,99 @@ class FoleyOrchestrator:
                 event.duration_sec,
                 attempt,
             )
-            score = self.verification.evaluate(current_prompt, audio_path)
+            verifier_result = self.verification.evaluate(current_prompt, audio_path)
+            raw_final_score = float(verifier_result.get("final_score", 0.0))
+            score = self.normalize_quality_score(raw_final_score)
+            cross_modal = self.compute_cross_modal_agreement(
+                current_prompt,
+                expected_keywords or set(),
+            )
+            self.emit_event("verifier_scored", {
+                "timestamp_sec": event.timestamp_sec,
+                "attempt": attempt,
+                "prompt": current_prompt,
+                "score_primary": round(verifier_result["score_primary"], 4),
+                "score_secondary": round(verifier_result["score_secondary"], 4),
+                "score_gap": round(verifier_result["score_gap"], 4),
+                "agreement_ok": verifier_result["agreement_ok"],
+                "raw_final_score": round(raw_final_score, 4),
+                "quality_score_normalized": round(score, 4),
+                "quality_threshold": round(self.quality_threshold, 4),
+                "verifier_gap_delta": verifier_result["verifier_gap_delta"],
+                "audio_file_path": audio_path,
+                "threshold": self.quality_threshold,
+            })
+            self.emit_event("cross_modal_checked", {
+                "timestamp_sec": event.timestamp_sec,
+                "attempt": attempt,
+                "prompt": current_prompt,
+                "agreement_score": round(cross_modal["agreement_score"], 4),
+                "agreement_ok": cross_modal["agreement_ok"],
+                "matched_keywords": cross_modal["matched_keywords"],
+                "missing_keywords": cross_modal["missing_keywords"][:8],
+                "threshold": self.cross_modal_threshold,
+            })
+            # Keep old event for compatibility with existing dashboards.
             self.emit_event("clap_scored", {
                 "timestamp_sec": event.timestamp_sec,
                 "attempt": attempt,
                 "prompt": current_prompt,
                 "score": round(score, 4),
+                "raw_final_score": round(raw_final_score, 4),
                 "audio_file_path": audio_path,
-                "threshold": self.verification.threshold,
+                "threshold": self.quality_threshold,
             })
-
-            state.attempts.append(AttemptRecord(
-                attempt=attempt,
-                prompt=current_prompt,
-                score=score,
-                audio_file_path=audio_path,
-            ))
 
             if score > state.best_score:
                 state.best_score = score
                 state.best_audio_file_path = audio_path
                 state.best_prompt = current_prompt
 
+            uncertainty_reasons = []
+            if not verifier_result.get("agreement_ok", True):
+                uncertainty_reasons.append("verifier_disagreement")
+            if not cross_modal.get("agreement_ok", True):
+                uncertainty_reasons.append("cross_modal_mismatch")
+            uncertain = len(uncertainty_reasons) > 0
+            acceptance_blocked_by_uncertainty = False
+
+            state.attempts.append(AttemptRecord(
+                attempt=attempt,
+                prompt=current_prompt,
+                score=score,
+                raw_final_score=raw_final_score,
+                audio_file_path=audio_path,
+                verifier=verifier_result,
+                cross_modal=cross_modal,
+                uncertainty_reasons=uncertainty_reasons,
+                acceptance_blocked_by_uncertainty=False,
+            ))
+
             decision = self.planner.decide_iteration(
                 event=event,
                 current_prompt=current_prompt,
                 score=score,
-                threshold=self.verification.threshold,
+                threshold=self.quality_threshold,
                 attempt=attempt,
                 max_retries=self.max_retries,
                 state=state,
             )
+            if decision["action"] == "ACCEPT" and uncertain:
+                acceptance_blocked_by_uncertainty = True
+                if attempt >= self.max_retries:
+                    decision["action"] = "STOP_BEST"
+                    decision["reasoning"] = (
+                        f"{decision['reasoning']} | ACCEPT blocked due to uncertainty "
+                        f"({', '.join(uncertainty_reasons)}); forcing STOP_BEST."
+                    )
+                else:
+                    decision["action"] = "RETRY_REWRITE"
+                    decision["reasoning"] = (
+                        f"{decision['reasoning']} | ACCEPT blocked due to uncertainty "
+                        f"({', '.join(uncertainty_reasons)})."
+                    )
+                state.attempts[-1].acceptance_blocked_by_uncertainty = True
+
             state.reasoning_trace.append({
                 "attempt": attempt,
                 "action": decision["action"],
@@ -568,7 +774,13 @@ class FoleyOrchestrator:
                 "controller_source": decision["source"],
                 "current_prompt": current_prompt,
                 "score": round(score, 4),
+                "raw_final_score": round(raw_final_score, 4),
+                "normalized_score": round(score, 4),
                 "best_score_so_far": round(state.best_score, 4),
+                "verifier": verifier_result,
+                "cross_modal": cross_modal,
+                "uncertainty_reasons": uncertainty_reasons,
+                "acceptance_blocked_by_uncertainty": acceptance_blocked_by_uncertainty,
             })
             print(
                 f"  -> [Agent Decision] action={decision['action']} "
@@ -584,8 +796,24 @@ class FoleyOrchestrator:
                 "controller_source": decision["source"],
                 "current_prompt": current_prompt,
                 "score": round(score, 4),
+                "raw_final_score": round(raw_final_score, 4),
+                "normalized_score": round(score, 4),
+                "quality_threshold": round(self.quality_threshold, 4),
                 "best_score_so_far": round(state.best_score, 4),
+                "acceptance_blocked_by_uncertainty": acceptance_blocked_by_uncertainty,
             })
+            if uncertain:
+                self.emit_event("uncertainty_flagged", {
+                    "timestamp_sec": event.timestamp_sec,
+                    "attempt": attempt,
+                    "reasons": uncertainty_reasons,
+                    "score_gap": round(verifier_result.get("score_gap", 0.0), 4),
+                    "cross_modal_score": round(cross_modal.get("agreement_score", 0.0), 4),
+                    "raw_final_score": round(raw_final_score, 4),
+                    "quality_score_normalized": round(score, 4),
+                    "quality_threshold": round(self.quality_threshold, 4),
+                    "acceptance_blocked_by_uncertainty": acceptance_blocked_by_uncertainty,
+                })
 
             if decision["action"] == "ACCEPT":
                 print("  -> [Agent] Accepting candidate for this event.")
@@ -615,6 +843,7 @@ class FoleyOrchestrator:
             "duration_sec": event.duration_sec,
             "selected_prompt": event.refined_prompt,
             "final_score": round(event.similarity_score, 4),
+            "quality_threshold": round(self.quality_threshold, 4),
             "audio_file_path": event.audio_file_path,
             "accepted": state.accepted,
         })
@@ -635,7 +864,9 @@ class FoleyOrchestrator:
         return {
             "input_video_path": input_video_path,
             "output_video_path": output_video_path,
-            "clap_threshold": self.verification.threshold,
+            "quality_threshold": self.quality_threshold,
+            "clap_score_min": self.clap_score_min,
+            "clap_score_max": self.clap_score_max,
             "event_count": len(events),
             "vlm_log": vlm_log,
             "events": [
@@ -651,10 +882,16 @@ class FoleyOrchestrator:
                             "attempt": i + 1,
                             "action": t.get("action"),
                             "score": t.get("score"),
+                            "raw_final_score": t.get("raw_final_score"),
+                            "normalized_score": t.get("normalized_score"),
                             "reasoning": t.get("reasoning"),
                             "confidence": t.get("confidence"),
                             "controller_source": t.get("controller_source"),
                             "prompt": t.get("current_prompt"),
+                            "uncertainty_reasons": t.get("uncertainty_reasons"),
+                            "acceptance_blocked_by_uncertainty": t.get("acceptance_blocked_by_uncertainty"),
+                            "verifier": t.get("verifier"),
+                            "cross_modal": t.get("cross_modal"),
                         }
                         for i, t in enumerate(e.agent_trace or [])
                     ],
@@ -749,7 +986,7 @@ class FoleyOrchestrator:
             "output_path": output_path,
             "prompt": prompt,
             "max_retries": self.max_retries,
-            "clap_threshold": self.verification.threshold,
+            "quality_threshold": self.quality_threshold,
         })
         if not output_path:
             output_path = f"foley_video_{int(time.time())}.mp4"
@@ -787,7 +1024,15 @@ class FoleyOrchestrator:
                 if vlm_log.startswith("Error:"):
                     raise RuntimeError(f"Perception failed: {vlm_log}")
                 self.emit_event("perception_completed", {"vlm_log": vlm_log})
-                audio_plan = self.planner.create_audio_plan(vlm_log, prepared_duration)
+                sc = self.evaluate_planner_self_consistency(vlm_log, prepared_duration)
+                self.emit_event("self_consistency_checked", {
+                    "stable": sc["stable"],
+                    "num_runs": sc["num_runs"],
+                    "count_variance": round(sc["count_variance"], 4),
+                    "avg_timestamp_diff": round(sc["avg_timestamp_diff"], 4),
+                    "avg_prompt_jaccard": round(sc["avg_prompt_jaccard"], 4),
+                })
+                audio_plan = sc["selected_plan"]
                 if not audio_plan:
                     print("[Agent] Planner returned no events. Injecting one ambient fallback event.")
                     audio_plan = [AudioEvent(
@@ -807,10 +1052,17 @@ class FoleyOrchestrator:
                         for e in audio_plan
                     ],
                 })
+                expected_keywords = self.extract_expected_audio_keywords(vlm_log)
+            if not prompt.strip():
+                self.emit_event("cross_modal_expected_keywords", {
+                    "keywords": sorted(list(expected_keywords))[:12],
+                })
+            else:
+                expected_keywords = set()
 
             final_events = []
             for event in audio_plan:
-                final_events.append(self.run_event_agent(event))
+                final_events.append(self.run_event_agent(event, expected_keywords=expected_keywords))
                 print("-" * 40)
 
             self.stitch_audio_to_video(prepared_video_path, final_events, output_path)
@@ -850,7 +1102,7 @@ class FoleyOrchestrator:
             "mode": "audio_only",
             "prompt": clean_prompt,
             "max_retries": self.max_retries,
-            "clap_threshold": self.verification.threshold,
+            "quality_threshold": self.quality_threshold,
         })
         event = AudioEvent(
             timestamp_sec=0.0,
