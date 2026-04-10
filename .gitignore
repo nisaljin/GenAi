@@ -5,3 +5,4 @@ generated_audio/
 output_foley_video.mp4
 temp_mixed_audio.wav
 temp_trimmed_input.mp4
+__pycache__/

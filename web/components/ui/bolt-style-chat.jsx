@@ -7,7 +7,6 @@ import {
   Paperclip,
   Image,
   FileCode,
-  Bolt,
   SendHorizontal,
   LoaderCircle,
   Video
@@ -87,41 +86,6 @@ function estimateTypewriterMs(text) {
   const tokenCount = getTypewriterTokens(text).length
   const ms = tokenCount * TYPEWRITER_STEP_MS + 250
   return Math.max(600, Math.min(ms, 9000))
-}
-
-function AnnouncementBadge({ text, href = '#' }) {
-  const content = (
-    <>
-      <span
-        className="absolute top-0 left-0 right-0 h-1/2 pointer-events-none opacity-70 mix-blend-overlay"
-        style={{ background: 'radial-gradient(ellipse at center top, rgba(255, 255, 255, 0.15) 0%, transparent 70%)' }}
-      />
-      <span
-        className="absolute -top-px left-1/2 -translate-x-1/2 h-[2px] w-[100px] opacity-60"
-        style={{
-          background: 'linear-gradient(90deg, transparent 0%, rgba(37, 119, 255, 0.8) 20%, rgba(126, 93, 225, 0.8) 50%, rgba(59, 130, 246, 0.8) 80%, transparent 100%)',
-          filter: 'blur(0.5px)'
-        }}
-      />
-      <Bolt className="size-4 relative z-10 text-white" />
-      <span className="relative z-10 text-white font-medium">{text}</span>
-    </>
-  )
-
-  const className = 'relative inline-flex items-center gap-2 px-5 py-2 min-h-[40px] rounded-full text-sm overflow-hidden transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] cursor-pointer'
-  const style = {
-    background: 'linear-gradient(135deg, rgba(255,255,255,0.1), rgba(255,255,255,0.05))',
-    backdropFilter: 'blur(20px) saturate(140%)',
-    boxShadow: 'inset 0 1px rgba(255,255,255,0.2), inset 0 -1px rgba(0,0,0,0.1), 0 8px 32px -8px rgba(0,0,0,0.1), 0 0 0 1px rgba(255,255,255,0.08)'
-  }
-
-  return href !== '#' ? (
-    <a href={href} target="_blank" rel="noopener noreferrer" className={className} style={style}>
-      {content}
-    </a>
-  ) : (
-    <button className={className} style={style}>{content}</button>
-  )
 }
 
 function RayBackground() {
@@ -557,10 +521,8 @@ function mapEventToDisplay(event) {
 }
 
 export function BoltStyleChat({
-  title = 'What will you',
-  subtitle = 'Upload a video or skip upload for prompt-only audio. Generate and watch the agent reason live.',
-  announcementText = 'Foley Agent Live Streaming',
-  announcementHref = '#',
+  title = 'Generate grounded Foley',
+  subtitle = 'Upload a video to synthesize scene-aligned Foley with verifier checks, cross-modal agreement, and transparent agent reasoning.',
   websocketUrl = process.env.NEXT_PUBLIC_AGENT_WS_URL || 'ws://localhost:8010/ws/foley',
   apiBaseUrl = process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8010'
 }) {
@@ -569,6 +531,10 @@ export function BoltStyleChat({
   const [hasSubmitted, setHasSubmitted] = useState(false)
   const [lastRequest, setLastRequest] = useState(null)
   const [canRetry, setCanRetry] = useState(false)
+  const titleTokens = String(title || '').trim().split(/\s+/).filter(Boolean)
+  const titleLead = titleTokens[0] || 'Generate'
+  const titleHighlight = titleTokens[1] || 'grounded'
+  const titleTail = titleTokens.slice(2).join(' ') || 'Foley'
   const wsRef = useRef(null)
   const eventQueueRef = useRef([])
   const queueTimerRef = useRef(null)
@@ -742,16 +708,12 @@ export function BoltStyleChat({
     <div className="relative flex flex-col items-center justify-center min-h-screen w-full overflow-hidden bg-[#0f0f0f]">
       <RayBackground />
 
-      <div className="absolute top-[70px]">
-        <AnnouncementBadge text={announcementText} href={announcementHref} />
-      </div>
-
       <div className="relative z-10 flex flex-col items-center justify-center w-full px-4 py-16 sm:py-20">
         <div className="text-center mb-6">
           <h1 className="text-4xl sm:text-5xl font-bold text-white tracking-tight mb-1">
-            {title}{' '}
-            <span className="bg-gradient-to-b from-[#4da5fc] via-[#4da5fc] to-white bg-clip-text text-transparent italic">score</span>{' '}
-            audio?
+            {titleLead}{' '}
+            <span className="inline-block pr-[0.06em] pb-[0.08em] leading-[1.08] bg-gradient-to-b from-[#4da5fc] via-[#4da5fc] to-white bg-clip-text text-transparent italic">{titleHighlight}</span>{' '}
+            {titleTail}
           </h1>
           <p className="text-base font-semibold sm:text-lg text-[#8a8a8f] max-w-2xl">{subtitle}</p>
         </div>
