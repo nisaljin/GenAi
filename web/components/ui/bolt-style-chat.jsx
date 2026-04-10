@@ -23,6 +23,11 @@ const REASONING_EVENT_TYPES = new Set([
   'vlm_request_failed',
   'attempt_started',
   'clap_scored',
+  'verifier_scored',
+  'cross_modal_checked',
+  'cross_modal_expected_keywords',
+  'self_consistency_checked',
+  'uncertainty_flagged',
   'decision_made',
   'event_completed',
   'perception_completed',
@@ -423,7 +428,46 @@ function mapEventToDisplay(event) {
       text: `Planned ${p.event_count} event(s).\n${formatPlanEvents(p.events)}`
     }
   }
+  if (type === 'self_consistency_checked') {
+    return {
+      eventType: type,
+      label: 'Self Consistency',
+      text: `Stable: ${String(p.stable)}\nRuns: ${p.num_runs}\nCount variance: ${p.count_variance}\nAvg timestamp diff: ${p.avg_timestamp_diff}\nPrompt overlap: ${p.avg_prompt_jaccard}`
+    }
+  }
+  if (type === 'cross_modal_expected_keywords') {
+    const kws = Array.isArray(p.keywords) ? p.keywords.join(', ') : ''
+    return {
+      eventType: type,
+      label: 'Cross-Modal Target',
+      text: `Expected audio cues: ${kws || 'none'}`
+    }
+  }
   if (type === 'attempt_started') return { eventType: type, label: `Attempt ${p.attempt}`, text: `Prompt: ${p.prompt}` }
+  if (type === 'verifier_scored') {
+    return {
+      eventType: type,
+      label: 'Verifier Ensemble',
+      text: `Primary: ${p.score_primary}\nSecondary: ${p.score_secondary}\nFinal: ${p.final_score}\nGap: ${p.score_gap} (<= ${p.verifier_gap_delta})\nAgreement: ${String(p.agreement_ok)}`
+    }
+  }
+  if (type === 'cross_modal_checked') {
+    const matched = Array.isArray(p.matched_keywords) ? p.matched_keywords.join(', ') : ''
+    const missing = Array.isArray(p.missing_keywords) ? p.missing_keywords.join(', ') : ''
+    return {
+      eventType: type,
+      label: 'Cross-Modal Check',
+      text: `Score: ${p.agreement_score} (>= ${p.threshold})\nAgreement: ${String(p.agreement_ok)}\nMatched: ${matched || 'none'}\nMissing: ${missing || 'none'}`
+    }
+  }
+  if (type === 'uncertainty_flagged') {
+    const reasons = Array.isArray(p.reasons) ? p.reasons.join(', ') : 'unknown'
+    return {
+      eventType: type,
+      label: 'Uncertainty',
+      text: `Reasons: ${reasons}\nVerifier gap: ${p.score_gap}\nCross-modal score: ${p.cross_modal_score}`
+    }
+  }
   if (type === 'clap_scored') return { eventType: type, label: 'CLAP Score', text: `Score ${p.score} (threshold ${p.threshold})` }
   if (type === 'decision_made') return { eventType: type, label: `Decision: ${p.action}`, text: `${p.reasoning}\n(confidence ${p.confidence})` }
   if (type === 'event_completed') return { eventType: type, label: 'Event Completed', text: `Final score ${p.final_score}` }
