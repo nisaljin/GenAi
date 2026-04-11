@@ -400,7 +400,8 @@ class PlannerNode:
                 action = "RETRY_REWRITE"
 
             reasoning = str(decision.get("reasoning", "")).strip()
-            next_prompt = str(decision.get("next_prompt", "")).strip()
+            next_prompt_raw = decision.get("next_prompt", "")
+            next_prompt = next_prompt_raw.strip() if isinstance(next_prompt_raw, str) else ""
             confidence = float(decision.get("confidence", 0.5))
             confidence = min(max(confidence, 0.0), 1.0)
 
@@ -517,6 +518,8 @@ class FoleyOrchestrator:
         self.quality_threshold = float(os.getenv("QUALITY_THRESHOLD", "0.60"))
         self.self_consistency_runs = max(1, int(os.getenv("SELF_CONSISTENCY_RUNS", "3")))
         self.cross_modal_threshold = float(os.getenv("CROSS_MODAL_AGREEMENT_THRESHOLD", "0.35"))
+        self.prompt_only_verifier_abs_gap_max = float(os.getenv("PROMPT_ONLY_VERIFIER_ABS_GAP_MAX", "8.0"))
+        self.prompt_only_verifier_rel_gap_max = float(os.getenv("PROMPT_ONLY_VERIFIER_REL_GAP_MAX", "0.75"))
         self.max_video_seconds = float(os.getenv("MAX_VIDEO_SECONDS", "15"))
         self.video_output_dir = os.getenv("GENERATED_VIDEO_DIR", "./generated_outputs/video")
         self.temp_output_dir = os.getenv("GENERATED_TEMP_DIR", "./generated_outputs/tmp")
@@ -557,6 +560,21 @@ class FoleyOrchestrator:
             return 0.0
         normalized = (raw_final_score - self.clap_score_min) / denom
         return self._clip01(normalized)
+
+    def verifier_agreement_ok(self, verifier_result: Dict[str, Any], prompt_only_mode: bool = False) -> bool:
+        raw_agreement_ok = bool(verifier_result.get("agreement_ok", True))
+        if raw_agreement_ok:
+            return True
+        if not prompt_only_mode:
+            return False
+
+        score_primary = float(verifier_result.get("score_primary", 0.0))
+        score_secondary = float(verifier_result.get("score_secondary", 0.0))
+        score_gap = float(verifier_result.get("score_gap", abs(score_primary - score_secondary)))
+        rel_gap = score_gap / max(abs(score_primary), abs(score_secondary), 1e-6)
+        abs_ok = score_gap <= self.prompt_only_verifier_abs_gap_max
+        rel_ok = rel_gap <= self.prompt_only_verifier_rel_gap_max
+        return abs_ok or rel_ok
 
     def extract_expected_audio_keywords(self, vlm_log: str) -> Set[str]:
         candidate_words = {
@@ -650,7 +668,12 @@ class FoleyOrchestrator:
             "selected_plan": selected,
         }
 
-    def run_event_agent(self, event: AudioEvent, expected_keywords: Optional[Set[str]] = None) -> AudioEvent:
+    def run_event_agent(
+        self,
+        event: AudioEvent,
+        expected_keywords: Optional[Set[str]] = None,
+        prompt_only_mode: bool = False,
+    ) -> AudioEvent:
         state = EventAgentState(timestamp_sec=event.timestamp_sec, duration_sec=event.duration_sec)
         current_prompt = event.original_prompt
 
@@ -676,6 +699,10 @@ class FoleyOrchestrator:
             verifier_result = self.verification.evaluate(current_prompt, audio_path)
             raw_final_score = float(verifier_result.get("final_score", 0.0))
             score = self.normalize_quality_score(raw_final_score)
+            verifier_agreement_ok = self.verifier_agreement_ok(
+                verifier_result,
+                prompt_only_mode=prompt_only_mode,
+            )
             cross_modal = self.compute_cross_modal_agreement(
                 current_prompt,
                 expected_keywords or set(),
@@ -687,7 +714,8 @@ class FoleyOrchestrator:
                 "score_primary": round(verifier_result["score_primary"], 4),
                 "score_secondary": round(verifier_result["score_secondary"], 4),
                 "score_gap": round(verifier_result["score_gap"], 4),
-                "agreement_ok": verifier_result["agreement_ok"],
+                "agreement_ok": verifier_agreement_ok,
+                "agreement_ok_raw": verifier_result["agreement_ok"],
                 "raw_final_score": round(raw_final_score, 4),
                 "quality_score_normalized": round(score, 4),
                 "quality_threshold": round(self.quality_threshold, 4),
@@ -722,7 +750,7 @@ class FoleyOrchestrator:
                 state.best_prompt = current_prompt
 
             uncertainty_reasons = []
-            if not verifier_result.get("agreement_ok", True):
+            if not verifier_agreement_ok:
                 uncertainty_reasons.append("verifier_disagreement")
             if not cross_modal.get("agreement_ok", True):
                 uncertainty_reasons.append("cross_modal_mismatch")
@@ -824,7 +852,8 @@ class FoleyOrchestrator:
                 print("  -> [Agent] Stopping retries and using best candidate so far.")
                 break
 
-            next_prompt = str(decision.get("next_prompt", "")).strip()
+            next_prompt_raw = decision.get("next_prompt", "")
+            next_prompt = next_prompt_raw.strip() if isinstance(next_prompt_raw, str) else ""
             if decision["action"] == "RETRY_BEST" and state.best_prompt:
                 current_prompt = state.best_prompt
             elif next_prompt:
@@ -1122,7 +1151,7 @@ class FoleyOrchestrator:
             ],
         })
 
-        final_event = self.run_event_agent(event)
+        final_event = self.run_event_agent(event, prompt_only_mode=True)
         if not final_event.audio_file_path or not os.path.exists(final_event.audio_file_path):
             raise RuntimeError("Audio generation failed to produce an output file.")
 
