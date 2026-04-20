@@ -2,6 +2,9 @@
 
 Agentic pipeline that generates Foley audio from video (or prompt-only), scores quality with CLAP, and iteratively retries/refines until acceptance criteria are met.
 
+Main entrypoint:
+- `main.py`: root-level orchestrator for the agentic loop.
+
 ## Prerequisites
 
 - Python `3.10+` (tested with Python `3.12`)
@@ -10,11 +13,30 @@ Agentic pipeline that generates Foley audio from video (or prompt-only), scores 
 
 ## Repo Structure
 
-- `main.py`: core orchestration and agentic loop.
-- `server/`: backend APIs (`agent_ws_api.py`, `multi_model_api.py`).
+- `main.py`: root orchestrator and agentic loop.
+- `server/`: Python backend services, helper APIs, and launch scripts.
 - `web/`: Next.js frontend for upload + live event streaming.
 - `notebooks/`: teammate-facing deep-dive + stage test notebook.
 - `scripts/`: stage tests and helper scripts.
+
+## Backend Entry Points
+
+The `server/` folder contains multiple Python services:
+- `agent_ws_api.py`: local WebSocket bridge and upload/artifact server.
+- `multi_model_api.py`: model-serving API for perception, planning, execution, and verification.
+- `server.py`: standalone audio generation/evaluation API.
+- `inference_service.py`: additional inference utilities used by experiments and tests.
+
+## Runtime Roles
+
+In the default setup you described, these are the active pieces:
+- `main.py` contains the `FoleyOrchestrator` pipeline implementation.
+- `server/agent_ws_api.py` is the backend you run on the client machine; it imports `FoleyOrchestrator` from `main.py` and exposes `/upload-video`, `/artifacts/...`, and `/ws/foley`.
+- `server/multi_model_api.py` runs on the server and provides the model endpoints used by the orchestrator.
+
+The other Python files in `server/` are support or alternate entrypoints, not part of the default client/server run path:
+- `server.py`: a separate FastAPI service for audio generation and CLAP evaluation.
+- `inference_service.py`: helper inference utilities for experiments, tests, or alternate flows.
 
 ## Environment Setup
 
@@ -49,6 +71,9 @@ This is the recommended setup for your laptop:
 - `server/agent_ws_api.py` runs locally.
 - the heavy model API (`multi_model_api.py`) runs on a separate GPU server.
 - local `.env` points `VLM_API_URL` and `AUDIO_API_URL` to that remote GPU endpoint.
+- `main.py` is the root orchestrator that the WS bridge invokes when a run starts.
+- `main.py` uses Groq for the planner/controller path with `llama-3.3-70b-versatile`.
+- `server/multi_model_api.py` has its own planner default (`Qwen/Qwen2.5-7B-Instruct`) for the model-serving API when you run that service directly.
 
 Run with 2 terminals:
 

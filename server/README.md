@@ -2,7 +2,17 @@
 
 Backend services for the agentic Foley system.
 
-This folder contains two runtime services plus helper docs/scripts.
+This folder contains the runtime backend services, plus helper docs/scripts and a few support Python files.
+
+## 0. File Map
+
+- `main.py` lives at the repo root and defines `FoleyOrchestrator`.
+- `agent_ws_api.py`: local WebSocket bridge, upload ingestion, and artifact serving.
+- `multi_model_api.py`: model-serving API for perception, planning, execution, and verification.
+- `server.py`: standalone audio generation/evaluation API.
+- `inference_service.py`: additional inference utilities for experiments and tests.
+- `run_agent_ws_api.sh`: launch the WebSocket bridge.
+- `run_multi_model_api.sh`: launch the model-serving API.
 
 ## 1. Services
 
@@ -37,9 +47,11 @@ Model loading:
 
 Additional/alternate inference logic utilities for model calls and testing flows.
 
+This is a support module, not the default runtime backend.
+
 ## 1.4 Model Matrix
 
-Defaults are defined in `multi_model_api.py`:
+Defaults for the `multi_model_api.py` service are defined there:
 
 | Stage | Purpose | Default Model ID | Endpoint | Override Env |
 |---|---|---|---|---|
@@ -52,6 +64,8 @@ Additional model/runtime controls:
 - `OFFLOAD_AFTER_USE`: unload model after each request to reduce memory pressure.
 - `HF_TOKEN` / `HUGGINGFACE_HUB_TOKEN`: access gated/private models.
 - `HF_HOME` / `--cache-dir`: local model cache location.
+
+Note: the root-level orchestrator in `main.py` uses its own Groq-based planner/controller path and is not forced to use the same planner model as this service.
 
 ## 2. Startup
 
